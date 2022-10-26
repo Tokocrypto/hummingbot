@@ -1,16 +1,14 @@
 import asyncio
 import logging
-import time
-from typing import Optional, List
 
-from hummingbot.core.data_type.user_stream_tracker_data_source import \
-    UserStreamTrackerDataSource
-from hummingbot.logger import HummingbotLogger
+from typing import List, Optional
+
+from hummingbot.connector.exchange.bitfinex import ContentEventType
+from hummingbot.connector.exchange.bitfinex.bitfinex_auth import BitfinexAuth
 from hummingbot.connector.exchange.bitfinex.bitfinex_order_book import BitfinexOrderBook
 from hummingbot.connector.exchange.bitfinex.bitfinex_websocket import BitfinexWebsocket
-from hummingbot.connector.exchange.bitfinex.bitfinex_auth import BitfinexAuth
-from hummingbot.connector.exchange.bitfinex.bitfinex_order_book_message import \
-    BitfinexOrderBookMessage
+from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.logger import HummingbotLogger
 
 
 class BitfinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
@@ -42,19 +40,15 @@ class BitfinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
     def last_recv_time(self) -> float:
         return self._last_recv_time
 
-    async def listen_for_user_stream(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
+    async def listen_for_user_stream(self, output: asyncio.Queue):
         while True:
             try:
                 ws = await BitfinexWebsocket(self._bitfinex_auth).connect()
                 await ws.authenticate()
 
                 async for msg in ws.messages():
-                    transformed_msg: BitfinexOrderBookMessage = self._transform_message_from_exchange(msg)
-
-                    if transformed_msg is None:
-                        continue
-                    else:
-                        output.put_nowait(transformed_msg)
+                    if msg[1] not in [ContentEventType.HEART_BEAT, ContentEventType.AUTH, ContentEventType.INFO]:
+                        output.put_nowait(msg)
 
             except asyncio.CancelledError:
                 raise
@@ -64,14 +58,3 @@ class BitfinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     exc_info=True,
                 )
                 await asyncio.sleep(self.MESSAGE_TIMEOUT)
-
-    def _transform_message_from_exchange(self, msg) -> Optional[BitfinexOrderBookMessage]:
-        order_book_message: BitfinexOrderBookMessage = BitfinexOrderBook.diff_message_from_exchange(msg, time.time())
-        if any([
-            order_book_message.type_heartbeat,
-            order_book_message.event_auth,
-            order_book_message.event_info,
-        ]):
-            # skip unneeded events and types
-            return
-        return order_book_message

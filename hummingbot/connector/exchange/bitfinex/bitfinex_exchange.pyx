@@ -2,67 +2,59 @@ import asyncio
 import collections
 import json
 import logging
-import math
 import time
 import uuid
 from decimal import Decimal
-from typing import Optional, List, Dict, Any, AsyncIterable, Tuple
+from typing import Any, AsyncIterable, Dict, List, Optional, TYPE_CHECKING
 
 import aiohttp
-import pandas as pd
-from async_timeout import timeout
 from libc.stdint cimport int64_t
-from libcpp cimport bool
 
+from hummingbot.connector.exchange.bitfinex import (
+    AFF_CODE,
+    BITFINEX_REST_AUTH_URL,
+    BITFINEX_REST_URL,
+    BITFINEX_REST_URL_V1,
+    ContentEventType,
+    OrderStatus,
+)
+from hummingbot.connector.exchange.bitfinex.bitfinex_api_order_book_data_source import BitfinexAPIOrderBookDataSource
+from hummingbot.connector.exchange.bitfinex.bitfinex_auth import BitfinexAuth
+from hummingbot.connector.exchange.bitfinex.bitfinex_in_flight_order cimport BitfinexInFlightOrder
+from hummingbot.connector.exchange.bitfinex.bitfinex_order_book_tracker import BitfinexOrderBookTracker
+from hummingbot.connector.exchange.bitfinex.bitfinex_user_stream_tracker import BitfinexUserStreamTracker
+from hummingbot.connector.exchange.bitfinex.bitfinex_utils import (
+    convert_from_exchange_token,
+    convert_from_exchange_trading_pair,
+    convert_to_exchange_trading_pair,
+    get_precision,
+)
+from hummingbot.connector.exchange.bitfinex.bitfinex_websocket import BitfinexWebsocket
+from hummingbot.connector.exchange_base import ExchangeBase
+from hummingbot.connector.trading_rule cimport TradingRule
 from hummingbot.core.data_type.cancellation_result import CancellationResult
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.order_book cimport OrderBook
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.data_type.transaction_tracker import TransactionTracker
 from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
     MarketEvent,
     MarketOrderFailureEvent,
     OrderCancelledEvent,
-    SellOrderCreatedEvent,
-    TradeFee,
-    TradeType,
     OrderFilledEvent,
-    BuyOrderCompletedEvent,
     SellOrderCompletedEvent,
-    OrderType
+    SellOrderCreatedEvent,
 )
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
-from hummingbot.logger import HummingbotLogger
-from hummingbot.connector.exchange.bitfinex import (
-    BITFINEX_REST_URL_V1,
-    BITFINEX_REST_AUTH_URL,
-    BITFINEX_REST_URL,
-    SubmitOrder,
-    ContentEventType,
-    TAKER_FEE,
-    MAKER_FEE,
-    OrderStatus,
-    AFF_CODE
-)
-from hummingbot.connector.exchange.bitfinex.bitfinex_api_order_book_data_source import \
-    BitfinexAPIOrderBookDataSource
-from hummingbot.connector.exchange_base import ExchangeBase
-from hummingbot.connector.exchange.bitfinex.bitfinex_auth import BitfinexAuth
-from hummingbot.connector.exchange.bitfinex.bitfinex_websocket import BitfinexWebsocket
-from hummingbot.connector.exchange.bitfinex.bitfinex_in_flight_order cimport BitfinexInFlightOrder
-from hummingbot.connector.exchange.bitfinex.bitfinex_order_book_tracker import \
-    BitfinexOrderBookTracker
-from hummingbot.connector.exchange.bitfinex.bitfinex_user_stream_tracker import \
-    BitfinexUserStreamTracker
-from hummingbot.connector.trading_rule cimport TradingRule
 from hummingbot.core.utils.estimate_fee import estimate_fee
-from hummingbot.connector.exchange.bitfinex.bitfinex_utils import (
-    get_precision,
-    split_trading_pair,
-    convert_from_exchange_trading_pair,
-    convert_to_exchange_trading_pair,
-)
+from hummingbot.logger import HummingbotLogger
+
+if TYPE_CHECKING:
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter
 
 s_logger = None
 s_decimal_0 = Decimal(0)
@@ -96,7 +88,7 @@ cdef class BitfinexExchange(ExchangeBase):
     MARKET_RECEIVED_ASSET_EVENT_TAG = MarketEvent.ReceivedAsset.value
     MARKET_BUY_ORDER_COMPLETED_EVENT_TAG = MarketEvent.BuyOrderCompleted.value
     MARKET_SELL_ORDER_COMPLETED_EVENT_TAG = MarketEvent.SellOrderCompleted.value
-    MARKET_ORDER_CANCELLED_EVENT_TAG = MarketEvent.OrderCancelled.value
+    MARKET_ORDER_CANCELED_EVENT_TAG = MarketEvent.OrderCancelled.value
     MARKET_TRANSACTION_FAILURE_EVENT_TAG = MarketEvent.TransactionFailure.value
     MARKET_ORDER_FAILURE_EVENT_TAG = MarketEvent.OrderFailure.value
     MARKET_ORDER_FILLED_EVENT_TAG = MarketEvent.OrderFilled.value
@@ -115,20 +107,21 @@ cdef class BitfinexExchange(ExchangeBase):
         return s_logger
 
     def __init__(self,
+                 client_config_map: "ClientConfigAdapter",
                  bitfinex_api_key: str,
                  bitfinex_secret_key: str,
                  # interval which the class periodically pulls status from the rest API
                  poll_interval: float = 5.0,
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True):
-        super().__init__()
+        super().__init__(client_config_map)
 
         self._ev_loop = asyncio.get_event_loop()
         self._poll_notifier = asyncio.Event()
 
         self._trading_required = trading_required
         self._bitfinex_auth = BitfinexAuth(bitfinex_api_key, bitfinex_secret_key)
-        self._order_book_tracker = BitfinexOrderBookTracker(trading_pairs)
+        self._set_order_book_tracker(BitfinexOrderBookTracker(trading_pairs))
         self._user_stream_tracker = BitfinexUserStreamTracker(
             bitfinex_auth=self._bitfinex_auth, trading_pairs=trading_pairs)
         self._tx_tracker = BitfinexExchangeTransactionTracker(self)
@@ -194,7 +187,7 @@ cdef class BitfinexExchange(ExchangeBase):
         Get mapping of all the order books that are being tracked.
         :return: Dict[trading_pair : OrderBook]
         """
-        return self._order_book_tracker.order_books
+        return self.order_book_tracker.order_books
 
     @property
     def status_dict(self) -> Dict[str]:
@@ -205,7 +198,7 @@ cdef class BitfinexExchange(ExchangeBase):
         """
         return {
             # info about bids| ask and other stuffs
-            "order_books_initialized": self._order_book_tracker.ready,
+            "order_books_initialized": self.order_book_tracker.ready,
             # info from wallets
             "account_balance": len(
                 self._account_balances) > 0 if self._trading_required else True,
@@ -213,6 +206,10 @@ cdef class BitfinexExchange(ExchangeBase):
             "trading_rule_initialized":
                 len(self._trading_rules) > 0 if self._trading_required else True
         }
+
+    @property
+    def in_flight_orders(self) -> Dict[str, BitfinexInFlightOrder]:
+        return self._in_flight_orders
 
     async def get_ws(self):
         if self._ws._client is None or self._ws._client.open is False:
@@ -227,7 +224,8 @@ cdef class BitfinexExchange(ExchangeBase):
                           object order_type,
                           object order_side,
                           object amount,
-                          object price):
+                          object price,
+                          object is_maker = None):
         """
         *required
         function to calculate fees for a particular order
@@ -283,6 +281,7 @@ cdef class BitfinexExchange(ExchangeBase):
                 continue
 
             asset_name = balance_entry.currency
+            asset_name = convert_from_exchange_token(asset_name)
             # None or 0
             self._account_balances[asset_name] = Decimal(balance_entry.balance or 0)
             self._account_available_balances[asset_name] = Decimal(balance_entry.balance) - Decimal(balance_entry.unsettled_interest)
@@ -312,7 +311,7 @@ cdef class BitfinexExchange(ExchangeBase):
         Async function used by NetworkBase class to handle when a single market goes online
         """
         # when exchange is online start streams
-        self._order_tracker_task = self._order_book_tracker.start()
+        self._order_tracker_task = self.order_book_tracker.start()
         if self._trading_required:
             self._ws_task = safe_ensure_future(self._ws_message_listener())
             self._status_polling_task = safe_ensure_future(self._status_polling_loop())
@@ -469,8 +468,6 @@ cdef class BitfinexExchange(ExchangeBase):
 
         try:
             return await self._api_private_fn(http_method, path_url, data)
-        except Exception:
-            raise
         finally:
             self._pending_requests.pop(0)
 
@@ -552,7 +549,7 @@ cdef class BitfinexExchange(ExchangeBase):
         :returns: OrderBook for a specific trading pair
         """
         cdef:
-            dict order_books = self._order_book_tracker.order_books
+            dict order_books = self.order_book_tracker.order_books
 
         if trading_pair not in order_books:
             raise ValueError(f"No order book exists for '{trading_pair}'.")
@@ -664,6 +661,15 @@ cdef class BitfinexExchange(ExchangeBase):
         async for response in ws.messages(waitFor=waitFor):
             return response
 
+    def start_tracking_order(self,
+                             order_id: str,
+                             trading_pair: str,
+                             order_type: OrderType,
+                             trade_type: TradeType,
+                             price: Decimal,
+                             amount: Decimal,):
+        self.c_start_tracking_order(order_id, trading_pair, order_type, trade_type, price, amount)
+
     cdef c_start_tracking_order(self,
                                 str client_order_id,
                                 str trading_pair,
@@ -682,6 +688,7 @@ cdef class BitfinexExchange(ExchangeBase):
             trade_type,
             price,
             amount,
+            creation_timestamp=self.current_timestamp
         )
 
     cdef str c_buy(self, str trading_pair, object amount,
@@ -750,7 +757,8 @@ cdef class BitfinexExchange(ExchangeBase):
                     trading_pair,
                     decimal_amount,
                     decimal_price,
-                    order_id
+                    order_id,
+                    tracked_order.creation_timestamp
                 )
             )
         except asyncio.CancelledError:
@@ -836,7 +844,8 @@ cdef class BitfinexExchange(ExchangeBase):
                                                        trading_pair,
                                                        decimal_amount,
                                                        decimal_price,
-                                                       order_id))
+                                                       order_id,
+                                                       tracked_order.creation_timestamp))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -882,18 +891,18 @@ cdef class BitfinexExchange(ExchangeBase):
                 response = _response
                 break
 
-            self.logger().info(f"Successfully cancelled order {order_id}.")
+            self.logger().info(f"Successfully canceled order {order_id}.")
             self.c_stop_tracking_order(order_id)
-            self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+            self.c_trigger_event(self.MARKET_ORDER_CANCELED_EVENT_TAG,
                                  OrderCancelledEvent(self._current_timestamp, order_id))
             return order_id
 
         except IOError as e:
             if "order not found" in e.message:
                 # The order was never there to begin with. So cancelling it is a no-op but semantically successful.
-                self.logger().info(f"The order {order_id} does not exist on Bitfinex. No cancellation needed.")
+                self.logger().info(f"The order {order_id} does not exist on Bitfinex. No cancelation needed.")
                 self.c_stop_tracking_order(order_id)
-                self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                self.c_trigger_event(self.MARKET_ORDER_CANCELED_EVENT_TAG,
                                      OrderCancelledEvent(self._current_timestamp, order_id))
                 return order_id
         except asyncio.CancelledError:
@@ -933,6 +942,7 @@ cdef class BitfinexExchange(ExchangeBase):
         if _type not in [ContentEventType.TRADE_UPDATE]:
             return
         data = {
+            "trade_id": "",
             "type": _type,
             "order_id": 0,
             "maker_order_id": 0,
@@ -944,7 +954,7 @@ cdef class BitfinexExchange(ExchangeBase):
 
         # [CHAN_ID, TYPE, [ID,    SYMBOL,  MTS_CREATE,  ORDER_ID,   EXEC_AMOUNT....
         # [0,       'te', [40xx, 'tETHUSD', 157613xxxx, 3566953xxx, 0.04, .....
-        # .. EXEC_PRICE, ORDER_TYPE,      ORDER_PRICE  MAKER    FEE   FEE_CURRENCY
+        # .. EXEC_PRICE, ORDER_TYPE,      ORDER_PRICE, MAKER,   FEE,  FEE_CURRENCY, CID]]
         # .. 142.88,    'EXCHANGE LIMIT', 142.88,      1,       None, None, 1576132037108]]
         if _type == ContentEventType.TRADE_UPDATE:
             data["order_id"] = content[3]
@@ -956,8 +966,11 @@ cdef class BitfinexExchange(ExchangeBase):
             #   an order from the order book  - sell
             data["maker_order_id"] = content[3] if content[4] > 0 else None
             data["taker_order_id"] = content[3] if content[4] < 0 else None
+            data["trade_id"] = content[0]
             data["price"] = content[5]
             data["amount"] = content[4]
+            data["fee"] = content[9]
+            data["fee_currency"] = content[10]
 
         return data
 
@@ -967,7 +980,7 @@ cdef class BitfinexExchange(ExchangeBase):
         """
         async for event_message in self._iter_user_event_queue():
             try:
-                isWallet = event_message.event_wallet
+                isWallet = event_message[1] in [ContentEventType.WALLET_SNAPSHOT, ContentEventType.WALLET_UPDATE]
 
                 # update balances
                 if isWallet:
@@ -975,8 +988,8 @@ cdef class BitfinexExchange(ExchangeBase):
                     remote_asset_names = set()
                     asset_names_to_remove = set()
 
-                    event_type = event_message.content[1]
-                    content = event_message.content[2]
+                    event_type = event_message[1]
+                    content = event_message[2]
                     wallets = content if event_type == ContentEventType.WALLET_SNAPSHOT else [content]
 
                     for wallet in wallets:
@@ -984,7 +997,7 @@ cdef class BitfinexExchange(ExchangeBase):
                         if (wallet_type != "exchange"):
                             continue
 
-                        asset_name = wallet[1]
+                        asset_name = convert_from_exchange_token(wallet[1])
                         balance = wallet[2]
                         balance_available = wallet[4]
 
@@ -999,111 +1012,7 @@ cdef class BitfinexExchange(ExchangeBase):
 
                 # else (previous author)
                 else:
-                    content = self.parse_message_content(*event_message.content)
-                    if not content:
-                        continue
-                    event_type = content.get("type")
-                    # str - because from exchange come int; order.exchange_order_id is str
-                    exchange_order_ids = [
-                        str(content.get("order_id")),
-                        str(content.get("maker_order_id")),
-                        str(content.get("taker_order_id"))
-                    ]
-
-                    tracked_order = None
-                    for order in self._in_flight_orders.values():
-                        if order.exchange_order_id in exchange_order_ids:
-                            tracked_order = order
-                            break
-                    if tracked_order is None:
-                        continue
-
-                    order_type_description = tracked_order.order_type_description
-                    execute_price = Decimal(content.get("price", 0.0))
-                    execute_amount_diff = s_decimal_0
-
-                    # trade update is like rollup state. each event increment
-                    # amount and price. When amount is 0, it will meant order fill.
-                    if event_type in [ContentEventType.TRADE_UPDATE]:
-                        # amount_come - negative is sell, positive - buy.
-                        # for checking that order is fill
-                        amount_come = Decimal(content["amount"]).quantize(Decimal('1e-8'))
-                        execute_amount_diff = (abs(tracked_order.amount) - abs(amount_come)).quantize(Decimal('1e-8'))
-                        tracked_order.executed_amount_base += abs(amount_come)
-                        tracked_order.executed_amount_quote += abs(amount_come) * execute_price
-
-                    if execute_amount_diff > s_decimal_0.quantize(Decimal('1e-8')) \
-                            and event_type in [ContentEventType.TRADE_UPDATE]:
-                        self.logger().info(
-                            f"Order filled {execute_amount_diff} out of {tracked_order.amount} of the "
-                            f"{order_type_description} order {tracked_order.client_order_id}"
-                        )
-                        self.c_trigger_event(
-                            self.MARKET_ORDER_FILLED_EVENT_TAG,
-                            OrderFilledEvent(
-                                self._current_timestamp,
-                                tracked_order.client_order_id,
-                                tracked_order.trading_pair,
-                                tracked_order.trade_type,
-                                tracked_order.order_type,
-                                execute_price,
-                                tracked_order.executed_amount_base,
-                                self.c_get_fee(
-                                    tracked_order.base_asset,
-                                    tracked_order.quote_asset,
-                                    tracked_order.order_type,
-                                    tracked_order.trade_type,
-                                    execute_amount_diff,
-                                    execute_price,
-                                ),
-                                exchange_trade_id=tracked_order.exchange_order_id
-                            )
-                        )
-                        # buy
-                        if content["maker_order_id"]:
-                            if tracked_order.trade_type == TradeType.BUY:
-                                self.logger().info(
-                                    f"The market buy order {tracked_order.client_order_id} has completed "
-                                    f"according to Bitfinex user stream."
-                                )
-                                self.c_trigger_event(
-                                    self.MARKET_BUY_ORDER_COMPLETED_EVENT_TAG,
-                                    BuyOrderCompletedEvent(
-                                        self._current_timestamp,
-                                        tracked_order.client_order_id,
-                                        tracked_order.quote_asset,
-                                        tracked_order.base_asset,
-                                        (tracked_order.fee_asset or tracked_order.base_asset),
-                                        tracked_order.executed_amount_base,
-                                        tracked_order.executed_amount_quote,
-                                        tracked_order.fee_paid,
-                                        tracked_order.order_type
-                                    )
-                                )
-                            self.c_stop_tracking_order(tracked_order.client_order_id)
-                        # sell
-                        if content["taker_order_id"]:
-                            if tracked_order.trade_type == TradeType.SELL:
-                                self.logger().info(
-                                    f"The market sell order {tracked_order.client_order_id} has completed "
-                                    f"according to Bitfinex user stream."
-                                )
-
-                                self.c_trigger_event(
-                                    self.MARKET_SELL_ORDER_COMPLETED_EVENT_TAG,
-                                    SellOrderCompletedEvent(
-                                        self._current_timestamp,
-                                        tracked_order.client_order_id,
-                                        tracked_order.base_asset,
-                                        tracked_order.quote_asset,
-                                        (tracked_order.fee_asset or tracked_order.quote_asset),
-                                        tracked_order.executed_amount_base,
-                                        tracked_order.executed_amount_quote,
-                                        tracked_order.fee_paid,
-                                        tracked_order.order_type
-                                    )
-                                )
-                            self.c_stop_tracking_order(tracked_order.client_order_id)
+                    self._process_trade_event(event_message)
 
             except asyncio.CancelledError:
                 raise
@@ -1111,16 +1020,100 @@ cdef class BitfinexExchange(ExchangeBase):
                 self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
                 await asyncio.sleep(5.0)
 
+    def _process_trade_event(self, event_message: List[Any]):
+        content = self.parse_message_content(*event_message)
+        if not content:
+            return
+        event_type = content.get("type")
+        # str - because from exchange come int; order.exchange_order_id is str
+        exchange_order_ids = [
+            str(content.get("order_id")),
+            str(content.get("maker_order_id")),
+            str(content.get("taker_order_id"))
+        ]
+
+        tracked_order = None
+        for order in self._in_flight_orders.values():
+            if order.exchange_order_id in exchange_order_ids:
+                tracked_order = order
+                break
+        if tracked_order is None:
+            return
+
+        order_type_description = tracked_order.order_type_description
+        execute_price = Decimal(content.get("price", 0.0))
+        execute_amount_diff = s_decimal_0
+
+        # trade update is like rollup state. each event increment
+        # amount and price. When amount is 0, it will meant order fill.
+        if event_type in [ContentEventType.TRADE_UPDATE]:
+            updated = tracked_order.update_with_trade_update(content)
+
+            if updated:
+                amount_come = Decimal(str(content["amount"]))
+                execute_amount_diff = (abs(tracked_order.amount) - abs(amount_come)).quantize(Decimal('1e-8'))
+
+                self.logger().info(
+                    f"Order filled {amount_come} out of {tracked_order.amount} of the "
+                    f"{order_type_description} order {tracked_order.client_order_id}"
+                )
+                self.c_trigger_event(
+                    self.MARKET_ORDER_FILLED_EVENT_TAG,
+                    OrderFilledEvent(
+                        self._current_timestamp,
+                        tracked_order.client_order_id,
+                        tracked_order.trading_pair,
+                        tracked_order.trade_type,
+                        tracked_order.order_type,
+                        execute_price,
+                        tracked_order.executed_amount_base,
+                        AddedToCostTradeFee(
+                            flat_fees=[TokenAmount(tracked_order.fee_asset, Decimal(str(content.get("fee"))))]
+                        ),
+                        exchange_trade_id=str(content["trade_id"])
+                    )
+                )
+
+                if tracked_order.is_done and not tracked_order.is_cancelled:
+                    if tracked_order.trade_type == TradeType.BUY:
+                        event_type = self.MARKET_BUY_ORDER_COMPLETED_EVENT_TAG
+                        event_class = BuyOrderCompletedEvent
+                    else:
+                        event_type = self.MARKET_SELL_ORDER_COMPLETED_EVENT_TAG
+                        event_class = SellOrderCompletedEvent
+
+                    self.logger().info(
+                        f"The market {tracked_order.trade_type.name.lower()} "
+                        f"order {tracked_order.client_order_id} has completed "
+                        "according to Bitfinex user stream."
+                    )
+
+                    self.c_trigger_event(
+                        event_type,
+                        event_class(
+                            self._current_timestamp,
+                            tracked_order.client_order_id,
+                            tracked_order.base_asset,
+                            tracked_order.quote_asset,
+                            tracked_order.executed_amount_base,
+                            tracked_order.executed_amount_quote,
+                            tracked_order.order_type
+                        )
+                    )
+                    self.c_stop_tracking_order(tracked_order.client_order_id)
+
     async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
         try:
-            order_ids = list(map(lambda order: order.client_order_id, self._in_flight_orders.values()))
+            tracked_orders = self._in_flight_orders.copy().values()
+            client_oids = list(map(lambda order: order.client_order_id, tracked_orders))
+            exchange_oids = list(map(lambda order: int(order.exchange_order_id), tracked_orders))
 
             data = [
                 0,
                 "oc_multi",
                 None,
                 {
-                    "all": 1
+                    "id": exchange_oids
                 }
             ]
 
@@ -1131,26 +1124,22 @@ cdef class BitfinexExchange(ExchangeBase):
             await ws.emit(data)
 
             response = None
+            cancellation_results = []
             async for _response in ws.messages(waitFor=waitFor):
-                response = _response
+                cancelled_client_oids = [o[-1]['order_id'] for o in _response[2][4]]
+                self.logger().info(f"Succesfully canceled orders: {cancelled_client_oids}")
+                for c_oid in cancelled_client_oids:
+                    cancellation_results.append(CancellationResult(c_oid, True))
                 break
 
-            return list(map(lambda client_order_id: CancellationResult(client_order_id, True), order_ids))
+            return cancellation_results
         except Exception as e:
             self.logger().network(
-                f"Failed to cancel all orders: {order_ids}",
+                f"Failed to cancel all orders: {client_oids}",
                 exc_info=True,
                 app_warning_msg=f"Failed to cancel all orders on Bitfinex. Check API key and network connection."
             )
-            return list(map(lambda client_order_id: CancellationResult(client_order_id, False), order_ids))
-
-    async def get_active_exchange_markets(self) -> pd.DataFrame:
-        """
-        *required
-        Used by the discovery strategy to read order books of all actively trading markets,
-        and find opportunities to profit
-        """
-        return await BitfinexAPIOrderBookDataSource.get_active_exchange_markets()
+            return list(map(lambda client_order_id: CancellationResult(client_order_id, False), client_oids))
 
     @property
     def limit_orders(self) -> List[LimitOrder]:
@@ -1292,7 +1281,7 @@ cdef class BitfinexExchange(ExchangeBase):
                         base_execute_amount_diff,
                         base_execute_price,
                     ),
-                    exchange_trade_id=exchange_order_id,
+                    exchange_trade_id=str(int(self._time() * 1e6)),
                 )
                 self.logger().info(f"Filled {base_execute_amount_diff} out of {tracked_order.amount} of the "
                                    f"{order_type_description} order {client_order_id}.")
@@ -1317,11 +1306,8 @@ cdef class BitfinexExchange(ExchangeBase):
                                                                     tracked_order.client_order_id,
                                                                     tracked_order.base_asset,
                                                                     tracked_order.quote_asset,
-                                                                    (tracked_order.fee_asset
-                                                                     or tracked_order.base_asset),
                                                                     tracked_order.executed_amount_base,
                                                                     tracked_order.executed_amount_quote,
-                                                                    tracked_order.fee_paid,
                                                                     order_type))
                     else:
                         self.logger().info(f"The market sell order {tracked_order.client_order_id} has completed "
@@ -1331,16 +1317,13 @@ cdef class BitfinexExchange(ExchangeBase):
                                                                      tracked_order.client_order_id,
                                                                      tracked_order.base_asset,
                                                                      tracked_order.quote_asset,
-                                                                     (tracked_order.fee_asset
-                                                                      or tracked_order.quote_asset),
                                                                      tracked_order.executed_amount_base,
                                                                      tracked_order.executed_amount_quote,
-                                                                     tracked_order.fee_paid,
                                                                      order_type))
                 else:
-                    self.logger().info(f"The market order {tracked_order.client_order_id} has failed/been cancelled "
+                    self.logger().info(f"The market order {tracked_order.client_order_id} has failed/been canceled "
                                        f"according to order status API.")
-                    self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                    self.c_trigger_event(self.MARKET_ORDER_CANCELED_EVENT_TAG,
                                          OrderCancelledEvent(
                                              self._current_timestamp,
                                              tracked_order.client_order_id
@@ -1369,8 +1352,17 @@ cdef class BitfinexExchange(ExchangeBase):
                 order_type: OrderType,
                 order_side: TradeType,
                 amount: Decimal,
-                price: Decimal = s_decimal_nan) -> TradeFee:
-        return self.c_get_fee(base_currency, quote_currency, order_type, order_side, amount, price)
+                price: Decimal = s_decimal_nan,
+                is_maker: Optional[bool] = None) -> AddedToCostTradeFee:
+        return self.c_get_fee(base_currency, quote_currency, order_type, order_side, amount, price, is_maker)
 
     def get_order_book(self, trading_pair: str) -> OrderBook:
         return self.c_get_order_book(trading_pair)
+
+    async def all_trading_pairs(self) -> List[str]:
+        # This method should be removed and instead we should implement _initialize_trading_pair_symbol_map
+        return await BitfinexAPIOrderBookDataSource.fetch_trading_pairs()
+
+    async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
+        # This method should be removed and instead we should implement _get_last_traded_price
+        return await BitfinexAPIOrderBookDataSource.get_last_traded_prices(trading_pairs=trading_pairs)

@@ -1,20 +1,15 @@
-from hummingbot.client.config.config_var import ConfigVar
-from hummingbot.client.config.config_validators import (
-    validate_exchange,
-    validate_market_trading_pair,
-)
-from hummingbot.client.settings import (
-    required_exchanges,
-    EXAMPLE_PAIRS,
-)
 from typing import Optional
+
+from hummingbot.client.config.config_validators import validate_exchange, validate_market_trading_pair
+from hummingbot.client.config.config_var import ConfigVar
+from hummingbot.client.settings import AllConnectorSettings, required_exchanges
 
 
 def symbol_prompt():
-    market = dev_5_vwap_config_map.get("market").value
-    example = EXAMPLE_PAIRS.get(market)
-    return "Enter the token symbol you would like to trade on %s%s >>> " \
-           % (market, f" (e.g. {example})" if example else "")
+    exchange = dev_5_vwap_config_map.get("exchange").value
+    example = AllConnectorSettings.get_example_pairs().get(exchange)
+    return "Enter the trading pair you would like to trade on %s%s >>> " \
+           % (exchange, f" (e.g. {example})" if example else "")
 
 
 def str2bool(value: str):
@@ -23,14 +18,14 @@ def str2bool(value: str):
 
 # checks if the symbol pair is valid
 def validate_market_trading_pair_tuple(value: str) -> Optional[str]:
-    market = dev_5_vwap_config_map.get("market").value
+    market = dev_5_vwap_config_map.get("exchange").value
     return validate_market_trading_pair(market, value)
 
 
 def order_percent_of_volume_prompt():
     percent_slippage = dev_5_vwap_config_map.get("percent_slippage").value
     return ("What percent of open order volume up to %s percent slippage do you want" % percent_slippage
-            + "each order to be? (default is 100 percent)? >>> ")
+            + " each order to be? (default is 100 percent)? >>> ")
 
 
 dev_5_vwap_config_map = {
@@ -38,15 +33,17 @@ dev_5_vwap_config_map = {
         ConfigVar(key="strategy",
                   prompt="",
                   default="dev_5_vwap"),
-    "market":
-        ConfigVar(key="market",
+    "exchange":
+        ConfigVar(key="exchange",
                   prompt="Enter the name of the exchange >>> ",
                   validator=validate_exchange,
-                  on_validated=lambda value: required_exchanges.append(value)),
-    "market_trading_pair_tuple":
-        ConfigVar(key="market_trading_pair_tuple",
+                  on_validated=lambda value: required_exchanges.add(value),
+                  prompt_on_new=True),
+    "market":
+        ConfigVar(key="market",
                   prompt=symbol_prompt,
-                  validator=validate_market_trading_pair_tuple),
+                  validator=validate_market_trading_pair_tuple,
+                  prompt_on_new=True),
     "order_type":
         ConfigVar(key="order_type",
                   prompt="Enter type of order (limit/market) default is market >>> ",
@@ -101,7 +98,7 @@ dev_5_vwap_config_map = {
                   type_str="float"),
     "cancel_order_wait_time":
         ConfigVar(key="cancel_order_wait_time",
-                  prompt="How long do you want to wait before cancelling your limit order (in seconds). "
+                  prompt="How long do you want to wait before canceling your limit order (in seconds). "
                          "(Default is 60 seconds) ? >>> ",
                   required_if=lambda: dev_5_vwap_config_map.get("order_type").value == "limit",
                   type_str="float",

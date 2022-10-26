@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+from collections import defaultdict
+
 import aiohttp
 import asyncio
 import logging
@@ -10,13 +12,7 @@ from zlib import decompress, MAX_WBITS
 import pandas as pd
 import signalr_aio
 import ujson
-from signalr_aio import Connection
-from signalr_aio.hubs import Hub
 from async_timeout import timeout
-
-import requests
-import cachetools.func
-from decimal import Decimal
 
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
@@ -53,9 +49,8 @@ class BittrexAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     def __init__(self, trading_pairs: List[str]):
         super().__init__(trading_pairs)
-        self._websocket_connection: Optional[Connection] = None
-        self._websocket_hub: Optional[Hub] = None
         self._snapshot_msg: Dict[str, any] = {}
+        self._message_queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
     @classmethod
     async def get_last_traded_prices(cls, trading_pairs: List[str]) -> Dict[str, float]:
@@ -82,38 +77,6 @@ class BittrexAPIOrderBookDataSource(OrderBookTrackerDataSource):
             bids, asks = active_order_tracker.convert_snapshot_message_to_order_book_row(snapshot_msg)
             order_book.apply_snapshot(bids, asks, snapshot_msg.update_id)
             return order_book
-
-    async def websocket_connection(self) -> (signalr_aio.Connection, signalr_aio.hubs.Hub):
-        if self._websocket_connection and self._websocket_hub:
-            return self._websocket_connection, self._websocket_hub
-
-        self._websocket_connection = signalr_aio.Connection(BITTREX_WS_FEED, session=None)
-        self._websocket_hub = self._websocket_connection.register_hub("c3")
-
-        trading_pairs = self._trading_pairs
-        for trading_pair in trading_pairs:
-            self._websocket_hub.server.invoke("Subscribe", [f"orderbook_{trading_pair}_25"])
-            self._websocket_hub.server.invoke("Subscribe", [f"trade_{trading_pair}"])
-            self.logger().info(f"Subscribed to {trading_pair} deltas")
-
-        self._websocket_connection.start()
-        self.logger().info("Websocket connection started...")
-
-        return self._websocket_connection, self._websocket_hub
-
-    @staticmethod
-    @cachetools.func.ttl_cache(ttl=10)
-    def get_mid_price(trading_pair: str) -> Optional[Decimal]:
-        resp = requests.get(url="https://api.bittrex.com/api/v1.1/public/getmarketsummaries")
-        records = resp.json()
-        result = None
-        for record in records["result"]:
-            symbols = record["MarketName"].split("-")
-            pair = f"{symbols[1]}-{symbols[0]}"
-            if trading_pair == pair and record["Bid"] is not None and record["Ask"] is not None:
-                result = (Decimal(record["Bid"]) + Decimal(record["Ask"])) / Decimal("2")
-                break
-        return result
 
     @staticmethod
     async def fetch_trading_pairs() -> List[str]:
@@ -143,66 +106,82 @@ class BittrexAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data["sequence"] = response.headers["sequence"]
             return data
 
-    async def listen_for_trades(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
-        # Trade messages are received as Orderbook Deltas and handled by listen_for_order_book_stream()
-        # passa
+    async def listen_for_subscriptions(self):
         while True:
-            connection, hub = await self.websocket_connection()
+            ws = None
             try:
-                async for raw_message in self._socket_stream():
+                ws = await self._build_websocket_connection()
+                async for raw_message in self._checked_socket_stream(ws):
                     decoded: Dict[str, Any] = self._transform_raw_message(raw_message)
+                    self.logger().debug(f"Got ws message {decoded}.")
+                    topic = decoded["type"]
+                    if topic in ["delta", "trade"]:
+                        self._message_queues[topic].put_nowait(decoded)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().network(
+                    f"Unexpected error with websocket connection ({e}).",
+                    exc_info=True,
+                    app_warning_msg="Unexcpected error with WebSocket connection. Retrying in 30 seconds."
+                                    " Check network connection."
+                )
+                if ws is not None:
+                    ws.close()
+                await asyncio.sleep(30)
 
-                    # Processes snapshot messages
-                    if decoded["type"] == "trade":
-                        trades: Dict[str, any] = decoded
-                        for trade in trades["results"]["deltas"]:
-                            trade_msg: OrderBookMessage = BittrexOrderBook.trade_message_from_exchange(
-                                trade, metadata={"trading_pair": trades["results"]["marketSymbol"],
-                                                 "sequence": trades["results"]["sequence"]}, timestamp=trades["nonce"]
-                            )
-                            output.put_nowait(trade_msg)
+    async def _build_websocket_connection(self) -> signalr_aio.Connection:
+        websocket_connection = signalr_aio.Connection(BITTREX_WS_FEED, session=None)
+        websocket_hub = websocket_connection.register_hub("c3")
 
+        subscription_names = [f"trade_{trading_pair}" for trading_pair in self._trading_pairs]
+        subscription_names.extend([f"orderbook_{trading_pair}_25" for trading_pair in self._trading_pairs])
+        websocket_hub.server.invoke("Subscribe", subscription_names)
+        self.logger().info(f"Subscribed to {self._trading_pairs} deltas")
+
+        websocket_connection.start()
+        self.logger().info("Websocket connection started...")
+
+        return websocket_connection
+
+    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        msg_queue = self._message_queues["trade"]
+        while True:
+            try:
+                trades = await msg_queue.get()
+                for trade in trades["results"]["deltas"]:
+                    trade_msg: OrderBookMessage = BittrexOrderBook.trade_message_from_exchange(
+                        trade, metadata={"trading_pair": trades["results"]["marketSymbol"],
+                                         "sequence": trades["results"]["sequence"]}, timestamp=trades["nonce"]
+                    )
+                    output.put_nowait(trade_msg)
             except Exception:
                 self.logger().error("Unexpected error when listening on socket stream.", exc_info=True)
-            finally:
-                connection.close()
-                self._websocket_connection = self._websocket_hub = None
 
-    async def listen_for_order_book_diffs(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
-        # Orderbooks Deltas and Snapshots are handled by listen_for_order_book_stream()
-        # pass
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        msg_queue = self._message_queues["delta"]
         while True:
-            connection, hub = await self.websocket_connection()
             try:
-                async for raw_message in self._socket_stream():
-                    decoded: Dict[str, Any] = self._transform_raw_message(raw_message)
-
-                    # Processes diff messages
-                    if decoded["type"] == "delta":
-                        diff: Dict[str, any] = decoded
-                        diff_timestamp = diff["nonce"]
-                        diff_msg: OrderBookMessage = BittrexOrderBook.diff_message_from_exchange(
-                            diff["results"], diff_timestamp
-                        )
-                        output.put_nowait(diff_msg)
-
+                diff = await msg_queue.get()
+                diff_timestamp = diff["nonce"]
+                diff_msg: OrderBookMessage = BittrexOrderBook.diff_message_from_exchange(
+                    diff["results"], diff_timestamp
+                )
+                output.put_nowait(diff_msg)
             except Exception:
                 self.logger().error("Unexpected error when listening on socket stream.", exc_info=True)
-            finally:
-                connection.close()
-                self._websocket_connection = self._websocket_hub = None
 
-    async def _socket_stream(self) -> AsyncIterable[str]:
+    async def _checked_socket_stream(self, connection: signalr_aio.Connection) -> AsyncIterable[str]:
         try:
             while True:
                 async with timeout(MESSAGE_TIMEOUT):  # Timeouts if not receiving any messages for 10 seconds(ping)
-                    conn: signalr_aio.Connection = (await self.websocket_connection())[0]
-                    yield await conn.msg_queue.get()
+                    msg = await connection.msg_queue.get()
+                    yield msg
         except asyncio.TimeoutError:
-            self.logger().warning("Message recv() timed out. Going to reconnect...")
-            return
+            self.logger().warning("Message queue get() timed out. Going to reconnect...")
 
-    def _transform_raw_message(self, msg) -> Dict[str, Any]:
+    @staticmethod
+    def _transform_raw_message(msg) -> Dict[str, Any]:
         def _decode_message(raw_message: bytes) -> Dict[str, Any]:
             try:
                 decoded_msg: bytes = decompress(b64decode(raw_message, validate=True), -MAX_WBITS)

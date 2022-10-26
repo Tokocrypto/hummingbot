@@ -1,6 +1,6 @@
 ---
 version: 1
-template_version: 10
+template_version: 12
 
 formatters:
     simple:
@@ -31,11 +31,6 @@ handlers:
         when: "D"
         interval: 1
         backupCount: 7
-    report_proxy_handler:
-        class: hummingbot.logger.reporting_proxy_handler.ReportingProxyHandler
-        level: DEBUG
-        proxy_url: https://api.coinalpha.com/reporting-proxy-v2
-        capacity: 1
     "null":
         class: logging.NullHandler
         level: DEBUG
@@ -55,27 +50,19 @@ loggers:
         handlers: [console_info, file_handler]
     hummingbot.strategy:
         level: NETWORK
-        handlers: [console_info, file_handler, report_proxy_handler]
-        propagate: false
-    hummingbot.market:
-        level: NETWORK
-        handlers: [console_info, file_handler, report_proxy_handler]
+        handlers: [console_info, file_handler]
         propagate: false
     hummingbot.connector:
         level: NETWORK
-        handlers: [console_info, file_handler, report_proxy_handler]
+        handlers: [console_info, file_handler]
         propagate: false
     hummingbot.client:
         level: NETWORK
-        handlers: [console_info, file_handler, report_proxy_handler]
-        propagate: false
-    hummingbot.wallet:
-        level: NETWORK
-        handlers: [console_info, file_handler, report_proxy_handler]
+        handlers: [console_info, file_handler]
         propagate: false
     hummingbot.core.event.event_reporter:
         level: EVENT_LOG
-        handlers: [file_handler, report_proxy_handler]
+        handlers: [file_handler]
         propagate: false
     conf:
         level: NETWORK

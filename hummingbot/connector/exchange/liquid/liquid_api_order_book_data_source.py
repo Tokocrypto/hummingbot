@@ -4,14 +4,10 @@ import logging
 import pandas as pd
 import time
 from typing import Any, AsyncIterable, Dict, List, Optional
-from decimal import Decimal
 import ujson
-import requests
-import cachetools.func
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from hummingbot.core.utils import async_ttl_cache
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -59,52 +55,6 @@ class LiquidAPIOrderBookDataSource(OrderBookTrackerDataSource):
             data['trading_pair'] = '-'.join([data['base_currency'], data['quoted_currency']])
 
         return products
-
-    @classmethod
-    @async_ttl_cache(ttl=60 * 30, maxsize=1)  # TODO: Not really sure what this does
-    async def get_active_exchange_markets(cls) -> (pd.DataFrame):
-        """
-        Returned data frame should have 'currency_pair_code' as index and include
-        * usd volume
-        * baseAsset
-        * quoteAsset
-        """
-        # Fetch raw exchange and markets data from Liquid
-        exchange_markets_data: list = await cls.get_exchange_markets_data()
-
-        # TODO: Understand the behavior of a non async method wrapped by another async method
-        # Make sure doing this will not block other task
-        market_data: List[str, Any] = cls.filter_market_data(
-            exchange_markets_data=exchange_markets_data)
-
-        market_data = cls.reformat_trading_pairs(market_data)
-
-        # Build the data frame
-        all_markets_df: pd.DataFrame = pd.DataFrame.from_records(data=market_data, index='trading_pair')
-
-        btc_price: float = float(all_markets_df.loc['BTC-USD'].last_traded_price)
-        eth_price: float = float(all_markets_df.loc['ETH-USD'].last_traded_price)
-        usd_volume: float = [
-            (
-                volume * quote_price if trading_pair.endswith(("USD", "USDC")) else
-                volume * quote_price * btc_price if trading_pair.endswith("BTC") else
-                volume * quote_price * eth_price if trading_pair.endswith("ETH") else
-                volume
-            )
-            for trading_pair, volume, quote_price in zip(
-                all_markets_df.index,
-                all_markets_df.volume_24h.astype('float'),
-                all_markets_df.last_traded_price.astype('float')
-            )
-        ]
-
-        all_markets_df.loc[:, 'USDVolume'] = usd_volume
-        all_markets_df.loc[:, 'volume'] = all_markets_df.volume_24h
-        all_markets_df.rename(
-            {"base_currency": "baseAsset", "quoted_currency": "quoteAsset"}, axis="columns", inplace=True
-        )
-
-        return all_markets_df.sort_values("USDVolume", ascending=False)
 
     @classmethod
     async def get_exchange_markets_data(cls) -> (List):
@@ -163,19 +113,6 @@ class LiquidAPIOrderBookDataSource(OrderBookTrackerDataSource):
         ]
 
     @staticmethod
-    @cachetools.func.ttl_cache(ttl=10)
-    def get_mid_price(trading_pair: str) -> Optional[Decimal]:
-        resp = requests.get(url=Constants.GET_EXCHANGE_MARKETS_URL)
-        records = resp.json()
-        result = None
-        for record in records:
-            pair = f"{record['base_currency']}-{record['quoted_currency']}"
-            if trading_pair == pair and record["market_ask"] is not None and record["market_bid"] is not None:
-                result = (Decimal(record["market_ask"]) + Decimal(record["market_bid"])) / Decimal("2")
-                break
-        return result
-
-    @staticmethod
     async def fetch_trading_pairs() -> List[str]:
         try:
             # Returns a List of str, representing each active trading pair on the exchange.
@@ -198,23 +135,23 @@ class LiquidAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def get_trading_pairs(self) -> List[str]:
         """
-        Extract trading_pairs information from all_markets_df generated
-        in get_active_exchange_markets method.
+        Extract trading_pairs information.
         Along the way, also populate the self._trading_pair_id_conversion_dict,
         for downstream reference since Liquid API uses id instead of trading
         pair as the identifier
         """
         try:
             if not self.trading_pair_id_conversion_dict:
-                active_markets_df: pd.DataFrame = await self.get_active_exchange_markets()
-
-                if not self._trading_pairs:
-                    self._trading_pairs = active_markets_df.index.tolist()
+                exchange_markets_data = await self.get_exchange_markets_data()
+                market_data = self.filter_market_data(exchange_markets_data)
+                market_data = self.reformat_trading_pairs(market_data)
 
                 self.trading_pair_id_conversion_dict = {
-                    trading_pair: active_markets_df.loc[trading_pair, 'id']
-                    for trading_pair in self._trading_pairs
+                    md["trading_pair"]: md["id"] for md in market_data
                 }
+
+                if not self._trading_pairs:
+                    self._trading_pairs = list(self.trading_pair_id_conversion_dict.keys())
         except Exception:
             self._trading_pairs = []
             self.logger().network(
@@ -321,11 +258,8 @@ class LiquidAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     msg: str = await asyncio.wait_for(ws.recv(), timeout=Constants.MESSAGE_TIMEOUT)
                     yield msg
                 except asyncio.TimeoutError:
-                    try:
-                        pong_waiter = await ws.ping()
-                        await asyncio.wait_for(pong_waiter, timeout=Constants.PING_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        raise
+                    pong_waiter = await ws.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=Constants.PING_TIMEOUT)
         except asyncio.TimeoutError:
             self.logger().warning("WebSocket ping timed out. Going to reconnect...")
             return

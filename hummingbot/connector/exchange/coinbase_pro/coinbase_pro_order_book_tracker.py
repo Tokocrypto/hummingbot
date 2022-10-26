@@ -2,30 +2,22 @@
 
 import asyncio
 import bisect
-from collections import (
-    defaultdict,
-    deque
-)
 import logging
 import time
-from typing import (
-    Deque,
-    Dict,
-    List,
-    Optional
-)
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional
 
-from hummingbot.core.event.events import TradeType
-from hummingbot.logger import HummingbotLogger
-from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
-from hummingbot.connector.exchange.coinbase_pro.coinbase_pro_api_order_book_data_source import CoinbaseProAPIOrderBookDataSource
-from hummingbot.connector.exchange.coinbase_pro.coinbase_pro_order_book_message import CoinbaseProOrderBookMessage
-from hummingbot.core.data_type.order_book_message import (
-    OrderBookMessageType,
-    OrderBookMessage,
+from hummingbot.connector.exchange.coinbase_pro.coinbase_pro_active_order_tracker import CoinbaseProActiveOrderTracker
+from hummingbot.connector.exchange.coinbase_pro.coinbase_pro_api_order_book_data_source import (
+    CoinbaseProAPIOrderBookDataSource
 )
 from hummingbot.connector.exchange.coinbase_pro.coinbase_pro_order_book import CoinbaseProOrderBook
-from hummingbot.connector.exchange.coinbase_pro.coinbase_pro_active_order_tracker import CoinbaseProActiveOrderTracker
+from hummingbot.connector.exchange.coinbase_pro.coinbase_pro_order_book_message import CoinbaseProOrderBookMessage
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
+from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.logger import HummingbotLogger
 
 
 class CoinbaseProOrderBookTracker(OrderBookTracker):
@@ -37,11 +29,16 @@ class CoinbaseProOrderBookTracker(OrderBookTracker):
             cls._cbpobt_logger = logging.getLogger(__name__)
         return cls._cbpobt_logger
 
-    def __init__(self,
-                 trading_pairs: Optional[List[str]] = None):
-        super().__init__(data_source=CoinbaseProAPIOrderBookDataSource(trading_pairs=trading_pairs),
-                         trading_pairs=trading_pairs)
-        self._ev_loop: asyncio.BaseEventLoop = asyncio.get_event_loop()
+    def __init__(
+        self,
+        trading_pairs: Optional[List[str]] = None,
+        web_assistants_factory: Optional[WebAssistantsFactory] = None,
+    ):
+        super().__init__(
+            data_source=CoinbaseProAPIOrderBookDataSource(trading_pairs, web_assistants_factory),
+            trading_pairs=trading_pairs,
+        )
+        self._ev_loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
         self._order_book_snapshot_stream: asyncio.Queue = asyncio.Queue()
         self._order_book_diff_stream: asyncio.Queue = asyncio.Queue()
         self._process_msg_deque_task: Optional[asyncio.Task] = None
@@ -99,10 +96,8 @@ class CoinbaseProOrderBookTracker(OrderBookTracker):
                 # Log some statistics.
                 now: float = time.time()
                 if int(now / 60.0) > int(last_message_timestamp / 60.0):
-                    self.logger().debug("Diff messages processed: %d, rejected: %d, queued: %d",
-                                        messages_accepted,
-                                        messages_rejected,
-                                        messages_queued)
+                    self.logger().debug(f"Diff messages processed: {messages_accepted}, "
+                                        f"rejected: {messages_rejected}, queued: {messages_queued}")
                     messages_accepted = 0
                     messages_rejected = 0
                     messages_queued = 0
@@ -153,8 +148,7 @@ class CoinbaseProOrderBookTracker(OrderBookTracker):
                     # Output some statistics periodically.
                     now: float = time.time()
                     if int(now / 60.0) > int(last_message_timestamp / 60.0):
-                        self.logger().debug("Processed %d order book diffs for %s.",
-                                            diff_messages_accepted, trading_pair)
+                        self.logger().debug(f"Processed {diff_messages_accepted} order book diffs for {trading_pair}.")
                         diff_messages_accepted = 0
                     last_message_timestamp = now
                 elif message.type is OrderBookMessageType.SNAPSHOT:
@@ -168,7 +162,7 @@ class CoinbaseProOrderBookTracker(OrderBookTracker):
                         d_bids, d_asks = active_order_tracker.convert_diff_message_to_order_book_row(diff_message)
                         order_book.apply_diffs(d_bids, d_asks, diff_message.update_id)
 
-                    self.logger().debug("Processed order book snapshot for %s.", trading_pair)
+                    self.logger().debug(f"Processed order book snapshot for {trading_pair}.")
             except asyncio.CancelledError:
                 raise
             except Exception:

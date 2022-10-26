@@ -1,38 +1,27 @@
-#!/usr/bin/env python
 import asyncio
-from abc import ABC
-from collections import deque
-from enum import Enum
 import logging
-import pandas as pd
-import re
-from typing import (
-    Dict,
-    Deque,
-    Optional,
-    Tuple,
-    List)
 import time
-from hummingbot.core.event.events import OrderBookTradeEvent, TradeType
-from hummingbot.logger import HummingbotLogger
-from hummingbot.core.data_type.order_book import OrderBook
-from hummingbot.core.utils.async_utils import safe_ensure_future
-from .order_book_message import (
-    OrderBookMessageType,
-    OrderBookMessage,
-)
-from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from collections import defaultdict, deque
+from enum import Enum
+from typing import Deque, Dict, List, Optional, Tuple
 
-TRADING_PAIR_FILTER = re.compile(r"(BTC|ETH|USDT)$")
+import pandas as pd
+
+from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.order_book import OrderBook
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.event.events import OrderBookTradeEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.logger import HummingbotLogger
 
 
 class OrderBookTrackerDataSourceType(Enum):
-    # LOCAL_CLUSTER = 1 deprecated
     REMOTE_API = 2
     EXCHANGE_API = 3
 
 
-class OrderBookTracker(ABC):
+class OrderBookTracker:
     PAST_DIFF_WINDOW_SIZE: int = 32
     _obt_logger: Optional[HummingbotLogger] = None
 
@@ -50,11 +39,12 @@ class OrderBookTracker(ABC):
         self._tracking_tasks: Dict[str, asyncio.Task] = {}
         self._order_books: Dict[str, OrderBook] = {}
         self._tracking_message_queues: Dict[str, asyncio.Queue] = {}
-        self._past_diffs_windows: Dict[str, Deque] = {}
+        self._past_diffs_windows: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=self.PAST_DIFF_WINDOW_SIZE))
         self._order_book_diff_stream: asyncio.Queue = asyncio.Queue()
         self._order_book_snapshot_stream: asyncio.Queue = asyncio.Queue()
         self._order_book_trade_stream: asyncio.Queue = asyncio.Queue()
         self._ev_loop: asyncio.BaseEventLoop = asyncio.get_event_loop()
+        self._saved_message_queues: Dict[str, Deque[OrderBookMessage]] = defaultdict(lambda: deque(maxlen=1000))
 
         self._emit_trade_event_task: Optional[asyncio.Task] = None
         self._init_order_books_task: Optional[asyncio.Task] = None
@@ -64,6 +54,7 @@ class OrderBookTracker(ABC):
         self._order_book_diff_router_task: Optional[asyncio.Task] = None
         self._order_book_snapshot_router_task: Optional[asyncio.Task] = None
         self._update_last_trade_prices_task: Optional[asyncio.Task] = None
+        self._order_book_stream_listener_task: Optional[asyncio.Task] = None
 
     @property
     def data_source(self) -> OrderBookTrackerDataSource:
@@ -101,6 +92,9 @@ class OrderBookTracker(ABC):
         self._order_book_snapshot_listener_task = safe_ensure_future(
             self._data_source.listen_for_order_book_snapshots(self._ev_loop, self._order_book_snapshot_stream)
         )
+        self._order_book_stream_listener_task = safe_ensure_future(
+            self._data_source.listen_for_subscriptions()
+        )
         self._order_book_diff_router_task = safe_ensure_future(
             self._order_book_diff_router()
         )
@@ -137,6 +131,8 @@ class OrderBookTracker(ABC):
         if self._update_last_trade_prices_task is not None:
             self._update_last_trade_prices_task.cancel()
             self._update_last_trade_prices_task = None
+        if self._order_book_stream_listener_task is not None:
+            self._order_book_stream_listener_task.cancel()
         if len(self._tracking_tasks) > 0:
             for _, task in self._tracking_tasks.items():
                 task.cancel()
@@ -170,12 +166,15 @@ class OrderBookTracker(ABC):
                 self.logger().network("Unexpected error while fetching last trade price.", exc_info=True)
                 await asyncio.sleep(30)
 
+    async def _initial_order_book_for_trading_pair(self, trading_pair: str) -> OrderBook:
+        return await self._data_source.get_new_order_book(trading_pair)
+
     async def _init_order_books(self):
         """
         Initialize order books
         """
         for index, trading_pair in enumerate(self._trading_pairs):
-            self._order_books[trading_pair] = await self._data_source.get_new_order_book(trading_pair)
+            self._order_books[trading_pair] = await self._initial_order_book_for_trading_pair(trading_pair)
             self._tracking_message_queues[trading_pair] = asyncio.Queue()
             self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
             self.logger().info(f"Initialized order book for {trading_pair}. "
@@ -185,19 +184,22 @@ class OrderBookTracker(ABC):
 
     async def _order_book_diff_router(self):
         """
-        Route the real-time order book diff messages to the correct order book.
+        Routes the real-time order book diff messages to the correct order book.
         """
         last_message_timestamp: float = time.time()
+        messages_queued: int = 0
         messages_accepted: int = 0
         messages_rejected: int = 0
-        await self._order_books_initialized.wait()
+
         while True:
             try:
                 ob_message: OrderBookMessage = await self._order_book_diff_stream.get()
                 trading_pair: str = ob_message.trading_pair
 
                 if trading_pair not in self._tracking_message_queues:
-                    messages_rejected += 1
+                    messages_queued += 1
+                    # Save diff messages received before snapshots are ready
+                    self._saved_message_queues[trading_pair].append(ob_message)
                     continue
                 message_queue: asyncio.Queue = self._tracking_message_queues[trading_pair]
                 # Check the order book's initial update ID. If it's larger, don't bother.
@@ -212,15 +214,21 @@ class OrderBookTracker(ABC):
                 # Log some statistics.
                 now: float = time.time()
                 if int(now / 60.0) > int(last_message_timestamp / 60.0):
-                    self.logger().debug(f"Diff messages processed: {messages_accepted}, rejected: {messages_rejected}")
+                    self.logger().debug(f"Diff messages processed: {messages_accepted}, "
+                                        f"rejected: {messages_rejected}, queued: {messages_queued}")
                     messages_accepted = 0
                     messages_rejected = 0
+                    messages_queued = 0
 
                 last_message_timestamp = now
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().error("Unknown error. Retrying after 5 seconds.", exc_info=True)
+                self.logger().network(
+                    "Unexpected error routing order book messages.",
+                    exc_info=True,
+                    app_warning_msg="Unexpected error routing order book messages. Retrying after 5 seconds."
+                )
                 await asyncio.sleep(5.0)
 
     async def _order_book_snapshot_router(self):
@@ -243,8 +251,7 @@ class OrderBookTracker(ABC):
                 await asyncio.sleep(5.0)
 
     async def _track_single_book(self, trading_pair: str):
-        past_diffs_window: Deque[OrderBookMessage] = deque()
-        self._past_diffs_windows[trading_pair] = past_diffs_window
+        past_diffs_window = self._past_diffs_windows[trading_pair]
 
         message_queue: asyncio.Queue = self._tracking_message_queues[trading_pair]
         order_book: OrderBook = self._order_books[trading_pair]
@@ -253,29 +260,37 @@ class OrderBookTracker(ABC):
 
         while True:
             try:
-                message: OrderBookMessage = await message_queue.get()
+                saved_messages: Deque[OrderBookMessage] = self._saved_message_queues[trading_pair]
+
+                # Process saved messages first if there are any
+                if len(saved_messages) > 0:
+                    message = saved_messages.popleft()
+                else:
+                    message = await message_queue.get()
+
                 if message.type is OrderBookMessageType.DIFF:
                     order_book.apply_diffs(message.bids, message.asks, message.update_id)
                     past_diffs_window.append(message)
-                    while len(past_diffs_window) > self.PAST_DIFF_WINDOW_SIZE:
-                        past_diffs_window.popleft()
                     diff_messages_accepted += 1
 
                     # Output some statistics periodically.
                     now: float = time.time()
                     if int(now / 60.0) > int(last_message_timestamp / 60.0):
-                        self.logger().debug("Processed %d order book diffs for %s.",
-                                            diff_messages_accepted, trading_pair)
+                        self.logger().debug(f"Processed {diff_messages_accepted} order book diffs for {trading_pair}.")
                         diff_messages_accepted = 0
                     last_message_timestamp = now
                 elif message.type is OrderBookMessageType.SNAPSHOT:
                     past_diffs: List[OrderBookMessage] = list(past_diffs_window)
                     order_book.restore_from_snapshot_and_diffs(message, past_diffs)
-                    self.logger().debug("Processed order book snapshot for %s.", trading_pair)
+                    self.logger().debug(f"Processed order book snapshot for {trading_pair}.")
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().error("Unknown error. Retrying after 5 seconds.", exc_info=True)
+                self.logger().network(
+                    f"Unexpected error tracking order book for {trading_pair}.",
+                    exc_info=True,
+                    app_warning_msg="Unexpected error tracking order book. Retrying after 5 seconds."
+                )
                 await asyncio.sleep(5.0)
 
     async def _emit_trade_event_loop(self):
@@ -307,9 +322,7 @@ class OrderBookTracker(ABC):
                 # Log some statistics.
                 now: float = time.time()
                 if int(now / 60.0) > int(last_message_timestamp / 60.0):
-                    self.logger().debug("Trade messages processed: %d, rejected: %d",
-                                        messages_accepted,
-                                        messages_rejected)
+                    self.logger().debug(f"Trade messages processed: {messages_accepted}, rejected: {messages_rejected}")
                     messages_accepted = 0
                     messages_rejected = 0
 

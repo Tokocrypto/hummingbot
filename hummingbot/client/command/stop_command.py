@@ -2,8 +2,10 @@ import asyncio
 import platform
 import threading
 from typing import TYPE_CHECKING
+
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.core.utils.eth_gas_station_lookup import EthGasStationLookup
+
 if TYPE_CHECKING:
     from hummingbot.client.hummingbot_application import HummingbotApplication
 
@@ -12,22 +14,22 @@ class StopCommand:
     def stop(self,  # type: HummingbotApplication
              skip_order_cancellation: bool = False):
         if threading.current_thread() != threading.main_thread():
-            self.ev_loop.call_soon_threadsafe(self.stop)
+            self.ev_loop.call_soon_threadsafe(self.stop, skip_order_cancellation)
             return
         safe_ensure_future(self.stop_loop(skip_order_cancellation), loop=self.ev_loop)
 
     async def stop_loop(self,  # type: HummingbotApplication
                         skip_order_cancellation: bool = False):
         self.logger().info("stop command initiated.")
-        self._notify("\nWinding down...")
+        self.notify("\nWinding down...")
 
         # Restore App Nap on macOS.
         if platform.system() == "Darwin":
             import appnope
             appnope.nap()
 
-        if self._script_iterator is not None:
-            self._script_iterator.stop(self.clock)
+        if self._pmm_script_iterator is not None:
+            self._pmm_script_iterator.stop(self.clock)
 
         if self._trading_required and not skip_order_cancellation:
             # Remove the strategy from clock before cancelling orders, to
@@ -45,8 +47,8 @@ class StopCommand:
         if self.strategy_task is not None and not self.strategy_task.cancelled():
             self.strategy_task.cancel()
 
-        if EthGasStationLookup.get_instance().started:
-            EthGasStationLookup.get_instance().stop()
+        if RateOracle.get_instance().started:
+            RateOracle.get_instance().stop()
 
         if self.markets_recorder is not None:
             self.markets_recorder.stop()
@@ -54,7 +56,6 @@ class StopCommand:
         if self.kill_switch is not None:
             self.kill_switch.stop()
 
-        self.wallet = None
         self.strategy_task = None
         self.strategy = None
         self.market_pair = None

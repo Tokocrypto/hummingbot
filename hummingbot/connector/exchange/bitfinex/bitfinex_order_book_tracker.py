@@ -1,27 +1,24 @@
-from collections import defaultdict, deque
-import logging
-import time
-from typing import Deque, Dict, List, Optional, Set
-
 import asyncio
 import bisect
+import logging
+import time
 
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional, Set
+
+from hummingbot.connector.exchange.bitfinex.bitfinex_active_order_tracker import BitfinexActiveOrderTracker
+from hummingbot.connector.exchange.bitfinex.bitfinex_order_book import BitfinexOrderBook
+from hummingbot.connector.exchange.bitfinex.bitfinex_order_book_message import BitfinexOrderBookMessage
+from hummingbot.connector.exchange.bitfinex.bitfinex_order_book_tracker_entry import BitfinexOrderBookTrackerEntry
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import (
-    OrderBookMessageType,
     OrderBookMessage,
+    OrderBookMessageType,
 )
-from hummingbot.core.data_type.order_book_tracker import (
-    OrderBookTracker,
-)
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
-from hummingbot.connector.exchange.bitfinex.bitfinex_active_order_tracker import \
-    BitfinexActiveOrderTracker
-from hummingbot.connector.exchange.bitfinex.bitfinex_order_book import BitfinexOrderBook
-from hummingbot.connector.exchange.bitfinex.bitfinex_order_book_message import \
-    BitfinexOrderBookMessage
-from hummingbot.connector.exchange.bitfinex.bitfinex_order_book_tracker_entry import \
-    BitfinexOrderBookTrackerEntry
+
 from .bitfinex_api_order_book_data_source import BitfinexAPIOrderBookDataSource
 
 SAVED_MESSAGES_QUEUE_SIZE = 1000
@@ -77,7 +74,7 @@ class BitfinexOrderBookTracker(OrderBookTracker):
             self._active_order_trackers[trading_pair] = order_book_tracker_entry.active_order_tracker
             self._order_books[trading_pair] = order_book_tracker_entry.order_book
             self._tracking_message_queues[trading_pair] = asyncio.Queue()
-            self._tracking_tasks[trading_pair] = asyncio.ensure_future(self._track_single_book(trading_pair))
+            self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
             self.logger().info(f"Started order book tracking for {trading_pair}.")
 
         for trading_pair in deleted_trading_pair:
@@ -118,10 +115,8 @@ class BitfinexOrderBookTracker(OrderBookTracker):
                 # Log some statistics.
                 now: float = time.time()
                 if int(now / CALC_STAT_MINUTE) > int(last_message_timestamp / CALC_STAT_MINUTE):
-                    self.logger().debug("Diff messages processed: %d, rejected: %d, queued: %d",
-                                        messages_accepted,
-                                        messages_rejected,
-                                        messages_queued)
+                    self.logger().debug(f"Diff messages processed: {messages_accepted}, "
+                                        f"rejected: {messages_rejected}, queued: {messages_queued}")
                     messages_accepted = 0
                     messages_rejected = 0
                     messages_queued = 0
@@ -171,8 +166,7 @@ class BitfinexOrderBookTracker(OrderBookTracker):
                     # Output some statistics periodically.
                     now: float = time.time()
                     if int(now / CALC_STAT_MINUTE) > int(last_message_timestamp / CALC_STAT_MINUTE):
-                        self.logger().debug(
-                            "Processed %d order book diffs for %s.", diff_messages_accepted, trading_pair)
+                        self.logger().debug(f"Processed {diff_messages_accepted} order book diffs for {trading_pair}.")
                         diff_messages_accepted = 0
 
                     last_message_timestamp = now
@@ -193,7 +187,7 @@ class BitfinexOrderBookTracker(OrderBookTracker):
                         )
                         order_book.apply_diffs(d_bids, d_asks, diff_message.update_id)
 
-                    self.logger().debug("Processed order book snapshot for %s.", trading_pair)
+                    self.logger().debug(f"Processed order book snapshot for {trading_pair}.")
             except asyncio.CancelledError:
                 raise
             except Exception as err:

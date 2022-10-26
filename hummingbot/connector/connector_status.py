@@ -1,30 +1,63 @@
 #!/usr/bin/env python
 
 connector_status = {
+    'altmarkets': 'green',
+    'ascend_ex': 'yellow',
+    'balancer': 'green',
+    'beaxy': 'green',
     'binance': 'green',
     'binance_perpetual': 'yellow',
     'binance_perpetual_testnet': 'yellow',
-    'binance_us': 'yellow',
-    'bitfinex': 'green',
+    'binance_us': 'green',
+    'bitfinex': 'yellow',
+    'bitmart': 'yellow',
     'bittrex': 'yellow',
-    'celo': 'green',
-    'coinbase_pro': 'green',
-    'crypto_com': 'yellow',
-    'dydx': 'yellow',
-    'eterbase': 'red',
+    'bitmex': 'green',
+    'bitmex_perpetual': 'green',
+    'bitmex_testnet': 'yellow',
+    'bitmex_perpetual_testnet': 'yellow',
+    'blocktane': 'yellow',
+    'bybit_perpetual': 'green',
+    'bybit_perpetual_testnet': 'yellow',
+    'bybit_testnet': 'yellow',
+    'bybit': 'green',
+    'celo': 'yellow',
+    'coinbase_pro': 'yellow',
+    'coinflex': 'yellow',
+    'coinflex_test': 'yellow',
+    'coinflex_perpetual': 'yellow',
+    'coinflex_perpetual_testnet': 'yellow',
+    'coinzoom': 'yellow',
+    'crypto_com': 'green',
+    'digifinex': "yellow",
+    'dydx_perpetual': 'yellow',
     'ethereum': 'red',
+    'eve': 'yellow',
+    'ftx': 'green',
+    'gate_io': 'yellow',
+    'hitbtc': 'green',
     'huobi': 'green',
-    'kraken': 'yellow',
-    'kucoin': 'green',
+    'kraken': 'green',
+    'kucoin': 'yellow',
+    'kucoin_testnet': 'yellow',
+    'k2': 'red',
+    'latoken': 'green',
     'liquid': 'green',
     'loopring': 'yellow',
-    'okex': 'red',
-    'terra': 'yellow'
+    'mexc': 'yellow',
+    'ndax': 'yellow',
+    'ndax_testnet': 'yellow',
+    'okx': 'green',
+    'perpetual_finance': 'yellow',
+    'probit': 'yellow',
+    'probit_kr': 'yellow',
+    'terra': 'red',
+    'uniswap': 'yellow',
+    'uniswap_v3': 'yellow',
+    'wazirx': 'yellow'
 }
 
 warning_messages = {
-    'eterbase': 'Hack investigation and security audit is ongoing for Eterbase. Trading is currently disabled.',
-    'okex': 'OKEx is reportedly being investigated by Chinese authorities and has stopped withdrawals.'
 }
 
 
@@ -39,5 +72,5 @@ def get_connector_status(connector_name: str) -> str:
     if connector_name not in connector_status.keys():
         status = "UNKNOWN"
     else:
-        return connector_status[connector_name].upper()
+        return f"&c{connector_status[connector_name].upper()}"
     return status

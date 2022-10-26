@@ -19,9 +19,9 @@ from hummingbot.connector.exchange.loopring.loopring_api_order_book_data_source 
 from hummingbot.connector.exchange.loopring.loopring_order_book import LoopringOrderBook
 from hummingbot.connector.exchange.loopring.loopring_utils import get_ws_api_key
 
-LOOPRING_WS_URL = "wss://ws.loopring.io/v2/ws"
+LOOPRING_WS_URL = "wss://ws.api3.loopring.io/v3/ws"
 
-LOOPRING_ROOT_API = "https://api.loopring.io"
+LOOPRING_ROOT_API = "https://api3.loopring.io"
 
 
 class LoopringAPIUserStreamDataSource(UserStreamTrackerDataSource):
@@ -49,7 +49,7 @@ class LoopringAPIUserStreamDataSource(UserStreamTrackerDataSource):
     def last_recv_time(self):
         return self._last_recv_time
 
-    async def listen_for_user_stream(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
+    async def listen_for_user_stream(self, output: asyncio.Queue):
         while True:
             try:
                 ws_key: str = await get_ws_api_key()

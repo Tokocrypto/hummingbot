@@ -1,8 +1,19 @@
-import re
-from typing import Optional, Tuple
+import os
+import socket
+from decimal import Decimal
+from typing import Any, Dict
 
-from hummingbot.client.config.config_var import ConfigVar
-from hummingbot.client.config.config_methods import using_exchange
+from pydantic import Field, SecretStr
+
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap, ClientFieldData
+from hummingbot.core.data_type.trade_fee import TradeFeeSchema
+from hummingbot.core.utils.tracking_nonce import get_tracking_nonce
+
+DEFAULT_FEES = TradeFeeSchema(
+    maker_percent_fee_decimal=Decimal("0.0002"),
+    taker_percent_fee_decimal=Decimal("0.0004"),
+    buy_percent_fee_deducted_from_returns=True
+)
 
 
 CENTRALIZED = True
@@ -11,67 +22,82 @@ CENTRALIZED = True
 EXAMPLE_PAIR = "BTC-USDT"
 
 
-DEFAULT_FEES = [0.02, 0.04]
+BROKER_ID = "x-3QreWesy"
 
 
-RE_4_LETTERS_QUOTE = re.compile(r"^(\w+)(USDT|USDC|USDS|TUSD|BUSD|IDRT|BKRW|BIDR)$")
-RE_3_LETTERS_QUOTE = re.compile(r"^(\w+)(BTC|ETH|BNB|DAI|XRP|PAX|TRX|NGN|RUB|TRY|EUR|ZAR|UAH|GBP|USD|BRL)$")
+def get_client_order_id(order_side: str, trading_pair: object):
+    nonce = get_tracking_nonce()
+    symbols: str = trading_pair.split("-")
+    base: str = symbols[0].upper()
+    quote: str = symbols[1].upper()
+    base_str = f"{base[0]}{base[-1]}"
+    quote_str = f"{quote[0]}{quote[-1]}"
+    client_instance_id = hex(abs(hash(f"{socket.gethostname()}{os.getpid()}")))[2:6]
+    return f"{BROKER_ID}-{order_side.upper()[0]}{base_str}{quote_str}{client_instance_id}{nonce}"
 
 
-# Helper Functions ---
-def split_trading_pair(trading_pair: str) -> Optional[Tuple[str, str]]:
-    try:
-        m = RE_4_LETTERS_QUOTE.match(trading_pair)
-        if m is None:
-            m = RE_3_LETTERS_QUOTE.match(trading_pair)
-        return m.group(1), m.group(2)
-    except Exception as e:
-        raise e
+def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
+    """
+    Verifies if a trading pair is enabled to operate with based on its exchange information
+    :param exchange_info: the exchange information for a trading pair
+    :return: True if the trading pair is enabled, False otherwise
+    """
+    return exchange_info.get("status", None) == "TRADING"
 
 
-def convert_from_exchange_trading_pair(exchange_trading_pair: str) -> Optional[str]:
-    if split_trading_pair(exchange_trading_pair) is None:
-        return None
-    base_asset, quote_asset = split_trading_pair(exchange_trading_pair)
-    return f"{base_asset}-{quote_asset}"
+class BinancePerpetualConfigMap(BaseConnectorConfigMap):
+    connector: str = Field(default="binance_perpetual", client_data=None)
+    binance_perpetual_api_key: SecretStr = Field(
+        default=...,
+        client_data=ClientFieldData(
+            prompt=lambda cm: "Enter your Binance Perpetual API key",
+            is_secure=True,
+            is_connect_key=True,
+            prompt_on_new=True,
+        )
+    )
+    binance_perpetual_api_secret: SecretStr = Field(
+        default=...,
+        client_data=ClientFieldData(
+            prompt=lambda cm: "Enter your Binance Perpetual API secret",
+            is_secure=True,
+            is_connect_key=True,
+            prompt_on_new=True,
+        )
+    )
 
 
-def convert_to_exchange_trading_pair(hb_trading_pair: str) -> str:
-    return hb_trading_pair.replace("-", "")
-
-
-KEYS = {
-    "binance_perpetual_api_key":
-        ConfigVar(key="binance_perpetual_api_key",
-                  prompt="Enter your Binance Perpetual API key >>> ",
-                  required_if=using_exchange("binance_perpetual"),
-                  is_secure=True,
-                  is_connect_key=True),
-    "binance_perpetual_api_secret":
-        ConfigVar(key="binance_perpetual_api_secret",
-                  prompt="Enter your Binance Perpetual API secret >>> ",
-                  required_if=using_exchange("binance_perpetual"),
-                  is_secure=True,
-                  is_connect_key=True),
-
-}
+KEYS = BinancePerpetualConfigMap.construct()
 
 OTHER_DOMAINS = ["binance_perpetual_testnet"]
 OTHER_DOMAINS_PARAMETER = {"binance_perpetual_testnet": "binance_perpetual_testnet"}
 OTHER_DOMAINS_EXAMPLE_PAIR = {"binance_perpetual_testnet": "BTC-USDT"}
 OTHER_DOMAINS_DEFAULT_FEES = {"binance_perpetual_testnet": [0.02, 0.04]}
-OTHER_DOMAINS_KEYS = {"binance_perpetual_testnet": {
-    # add keys for testnet
-    "binance_perpetual_testnet_api_key":
-        ConfigVar(key="binance_perpetual_testnet_api_key",
-                  prompt="Enter your Binance Perpetual testnet API key >>> ",
-                  required_if=using_exchange("binance_perpetual_testnet"),
-                  is_secure=True,
-                  is_connect_key=True),
-    "binance_perpetual_testnet_api_secret":
-        ConfigVar(key="binance_perpetual_testnet_api_secret",
-                  prompt="Enter your Binance Perpetual testnet API secret >>> ",
-                  required_if=using_exchange("binance_perpetual_testnet"),
-                  is_secure=True,
-                  is_connect_key=True),
-}}
+
+
+class BinancePerpetualTestnetConfigMap(BaseConnectorConfigMap):
+    connector: str = Field(default="binance_perpetual_testnet", client_data=None)
+    binance_perpetual_testnet_api_key: SecretStr = Field(
+        default=...,
+        client_data=ClientFieldData(
+            prompt=lambda cm: "Enter your Binance Perpetual testnet API key",
+            is_secure=True,
+            is_connect_key=True,
+            prompt_on_new=True,
+        )
+    )
+    binance_perpetual_testnet_api_secret: SecretStr = Field(
+        default=...,
+        client_data=ClientFieldData(
+            prompt=lambda cm: "Enter your Binance Perpetual testnet API secret",
+            is_secure=True,
+            is_connect_key=True,
+            prompt_on_new=True,
+        )
+    )
+
+    class Config:
+        title = "binance_perpetual"
+
+
+OTHER_DOMAINS_KEYS = {"binance_perpetual_testnet": BinancePerpetualTestnetConfigMap.construct()}

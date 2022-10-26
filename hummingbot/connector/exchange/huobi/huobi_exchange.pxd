@@ -14,7 +14,6 @@ cdef class HuobiExchange(ExchangeBase):
         double _last_poll_timestamp
         double _last_timestamp
         object _poll_notifier
-        double _poll_interval
         object _shared_client
         public object _status_polling_task
         dict _trading_rules
@@ -23,6 +22,8 @@ cdef class HuobiExchange(ExchangeBase):
         public object _user_stream_event_listener_task
         public object _user_stream_tracker_task
         TransactionTracker _tx_tracker
+        object _api_factory
+        object _rest_assistant
 
     cdef c_did_timeout_tx(self, str tracking_id)
     cdef c_start_tracking_order(self,

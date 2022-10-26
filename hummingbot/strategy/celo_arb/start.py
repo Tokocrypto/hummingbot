@@ -19,15 +19,14 @@ def start(self):
         secondary_assets: Tuple[str, str] = self._initialize_market_assets(secondary_exchange,
                                                                            [secondary_trading_pair])[0]
     except ValueError as e:
-        self._notify(str(e))
+        self.notify(str(e))
         return
 
     market_names: List[Tuple[str, List[str]]] = [(secondary_exchange, [secondary_trading_pair])]
-    self._initialize_wallet(token_trading_pairs=list(secondary_assets))
     self._initialize_markets(market_names)
-    self.assets = set(secondary_assets)
 
     secondary_data = [self.markets[secondary_exchange], secondary_trading_pair] + list(secondary_assets)
     market_info = MarketTradingPairTuple(*secondary_data)
     self.market_trading_pair_tuples = [market_info]
-    self.strategy = CeloArbStrategy(market_info, min_profitability, order_amount, celo_slippage_buffer)
+    self.strategy = CeloArbStrategy()
+    self.strategy.init_params(market_info, min_profitability, order_amount, celo_slippage_buffer)

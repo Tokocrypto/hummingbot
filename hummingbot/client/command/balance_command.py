@@ -1,19 +1,18 @@
-from hummingbot.client.settings import (
-    GLOBAL_CONFIG_PATH,
-    ethereum_required_trading_pairs
-)
-from hummingbot.user.user_balances import UserBalances
-from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.client.config.global_config_map import global_config_map
-from hummingbot.client.config.config_helpers import (
-    save_to_yml
-)
-from hummingbot.client.config.config_validators import validate_decimal, validate_exchange
-from hummingbot.market.celo.celo_cli import CeloCLI
-from hummingbot.core.utils.market_price import usd_value
-import pandas as pd
+import asyncio
+import threading
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, Optional, List
+from typing import TYPE_CHECKING, Dict, List
+
+import pandas as pd
+
+from hummingbot.client.config.config_validators import validate_decimal, validate_exchange
+from hummingbot.client.performance import PerformanceMetrics
+from hummingbot.client.settings import AllConnectorSettings
+from hummingbot.connector.other.celo.celo_cli import CeloCLI
+from hummingbot.connector.other.celo.celo_data_types import KEYS as CELO_KEYS
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.user.user_balances import UserBalances
 
 if TYPE_CHECKING:
     from hummingbot.client.hummingbot_application import HummingbotApplication
@@ -25,128 +24,142 @@ OPTIONS = [
 
 
 class BalanceCommand:
-    def balance(self,
+    def balance(self,  # type: HummingbotApplication
                 option: str = None,
                 args: List[str] = None
                 ):
+        if threading.current_thread() != threading.main_thread():
+            self.ev_loop.call_soon_threadsafe(self.balance, option, args)
+            return
+
         self.app.clear_input()
         if option is None:
             safe_ensure_future(self.show_balances())
 
         elif option in OPTIONS:
-            config_map = global_config_map
-            file_path = GLOBAL_CONFIG_PATH
             if option == "limit":
-                config_var = config_map["balance_asset_limit"]
+                balance_asset_limit = self.client_config_map.balance_asset_limit
                 if args is None or len(args) == 0:
                     safe_ensure_future(self.show_asset_limits())
                     return
                 if len(args) != 3 or validate_exchange(args[0]) is not None or validate_decimal(args[2]) is not None:
-                    self._notify("Error: Invalid command arguments")
+                    self.notify("Error: Invalid command arguments")
                     self.notify_balance_limit_set()
                     return
                 exchange = args[0]
                 asset = args[1].upper()
                 amount = float(args[2])
-                if exchange not in config_var.value or config_var.value[exchange] is None:
-                    config_var.value[exchange] = {}
-                config_var.value[exchange][asset] = amount
-
-                self._notify(f"Limit for {asset} on {exchange} exchange set to {amount}")
-                save_to_yml(file_path, config_map)
+                if balance_asset_limit.get(exchange) is None:
+                    balance_asset_limit[exchange] = {}
+                if amount < 0 and asset in balance_asset_limit[exchange].keys():
+                    balance_asset_limit[exchange].pop(asset)
+                    self.notify(f"Limit for {asset} on {exchange} exchange removed.")
+                elif amount >= 0:
+                    balance_asset_limit[exchange][asset] = amount
+                    self.notify(f"Limit for {asset} on {exchange} exchange set to {amount}")
+                self.save_client_config()
 
             elif option == "paper":
-                config_var = config_map["paper_trade_account_balance"]
+                paper_balances = self.client_config_map.paper_trade.paper_trade_account_balance
                 if args is None or len(args) == 0:
                     safe_ensure_future(self.show_paper_account_balance())
                     return
                 if len(args) != 2 or validate_decimal(args[1]) is not None:
-                    self._notify("Error: Invalid command arguments")
+                    self.notify("Error: Invalid command arguments")
                     self.notify_balance_paper_set()
                     return
                 asset = args[0].upper()
                 amount = float(args[1])
-                paper_balances = dict(config_var.value) if config_var.value else {}
                 paper_balances[asset] = amount
-                config_var.value = paper_balances
-                self._notify(f"Paper balance for {asset} token set to {amount}")
-                save_to_yml(file_path, config_map)
+                self.notify(f"Paper balance for {asset} token set to {amount}")
+                self.save_client_config()
 
-    async def show_balances(self):
-        self._notify("Updating balances, please wait...")
-        all_ex_bals = await UserBalances.instance().all_balances_all_exchanges()
-        all_ex_avai_bals = UserBalances.instance().all_avai_balances_all_exchanges()
-        all_ex_limits: Optional[Dict[str, Dict[str, str]]] = global_config_map["balance_asset_limit"].value
+    async def show_balances(
+        self  # type: HummingbotApplication
+    ):
+        global_token_symbol = self.client_config_map.global_token.global_token_symbol
+        total_col_name = f"Total ({global_token_symbol})"
+        sum_not_for_show_name = "sum_not_for_show"
+        self.notify("Updating balances, please wait...")
+        network_timeout = float(self.client_config_map.commands_timeout.other_commands_timeout)
+        try:
+            all_ex_bals = await asyncio.wait_for(
+                UserBalances.instance().all_balances_all_exchanges(self.client_config_map), network_timeout
+            )
+        except asyncio.TimeoutError:
+            self.notify("\nA network error prevented the balances to update. See logs for more details.")
+            raise
+        all_ex_avai_bals = UserBalances.instance().all_available_balances_all_exchanges()
 
-        if all_ex_limits is None:
-            all_ex_limits = {}
+        exchanges_total = 0
 
         for exchange, bals in all_ex_bals.items():
-            self._notify(f"\n{exchange}:")
-            # df = await self.exchange_balances_df(bals, all_ex_limits.get(exchange, {}))
-            df, allocated_total = await self.exchange_balances_usd_df(bals, all_ex_avai_bals.get(exchange, {}))
+            self.notify(f"\n{exchange}:")
+            df, allocated_total = await self.exchange_balances_extra_df(exchange, bals, all_ex_avai_bals.get(exchange, {}))
             if df.empty:
-                self._notify("You have no balance on this exchange.")
+                self.notify("You have no balance on this exchange.")
             else:
-                lines = ["    " + line for line in df.to_string(index=False).split("\n")]
-                self._notify("\n".join(lines))
-                self._notify(f"\n  Total: $ {df['Total ($)'].sum():.0f}    "
-                             f"Allocated: {allocated_total / df['Total ($)'].sum():.2%}")
+                lines = [
+                    "    " + line for line in df.drop(sum_not_for_show_name, axis=1).to_string(index=False).split("\n")
+                ]
+                self.notify("\n".join(lines))
+                self.notify(f"\n  Total: {global_token_symbol} "
+                            f"{PerformanceMetrics.smart_round(df[total_col_name].sum())}")
+                allocated_percentage = 0
+                if df[sum_not_for_show_name].sum() != Decimal("0"):
+                    allocated_percentage = allocated_total / df[sum_not_for_show_name].sum()
+                self.notify(f"Allocated: {allocated_percentage:.2%}")
+                exchanges_total += df[total_col_name].sum()
 
-        celo_address = global_config_map["celo_address"].value
+        self.notify(f"\n\nExchanges Total: {global_token_symbol} {exchanges_total:.0f}    ")
+
+        celo_address = CELO_KEYS.celo_address if hasattr(CELO_KEYS, "celo_address") else None
         if celo_address is not None:
             try:
                 if not CeloCLI.unlocked:
                     await self.validate_n_connect_celo()
                 df = await self.celo_balances_df()
                 lines = ["    " + line for line in df.to_string(index=False).split("\n")]
-                self._notify("\ncelo:")
-                self._notify("\n".join(lines))
+                self.notify("\ncelo:")
+                self.notify("\n".join(lines))
             except Exception as e:
-                self._notify(f"\ncelo CLI Error: {str(e)}")
+                self.notify(f"\ncelo CLI Error: {str(e)}")
 
-        eth_address = global_config_map["ethereum_wallet"].value
-        if eth_address is not None:
-            df = await self.ethereum_balances_df()
-            lines = ["    " + line for line in df.to_string(index=False).split("\n")]
-            self._notify("\nethereum:")
-            self._notify("\n".join(lines))
-
-    async def exchange_balances_df(self,  # type: HummingbotApplication
-                                   exchange_balances: Dict[str, Decimal],
-                                   exchange_limits: Dict[str, str]):
-        rows = []
-        for token, bal in exchange_balances.items():
-            limit = Decimal(exchange_limits.get(token.upper(), 0)) if exchange_limits is not None else Decimal(0)
-            if bal == Decimal(0) and limit == Decimal(0):
-                continue
-            token = token.upper()
-            rows.append({"Asset": token.upper(),
-                         "Amount": round(bal, 4),
-                         "Limit": round(limit, 4) if limit > Decimal(0) else "-"})
-        df = pd.DataFrame(data=rows, columns=["Asset", "Amount", "Limit"])
-        df.sort_values(by=["Asset"], inplace=True)
-        return df
-
-    async def exchange_balances_usd_df(self,  # type: HummingbotApplication
-                                       ex_balances: Dict[str, Decimal],
-                                       ex_avai_balances: Dict[str, Decimal]):
+    async def exchange_balances_extra_df(self,  # type: HummingbotApplication
+                                         exchange: str,
+                                         ex_balances: Dict[str, Decimal],
+                                         ex_avai_balances: Dict[str, Decimal]):
+        conn_setting = AllConnectorSettings.get_connector_settings()[exchange]
+        global_token_symbol = self.client_config_map.global_token.global_token_symbol
+        total_col_name = f"Total ({global_token_symbol})"
         allocated_total = Decimal("0")
         rows = []
         for token, bal in ex_balances.items():
-            if bal == Decimal(0):
-                continue
             avai = Decimal(ex_avai_balances.get(token.upper(), 0)) if ex_avai_balances is not None else Decimal(0)
-            allocated = f"{(bal - avai) / bal:.0%}"
-            usd = await usd_value(token, bal)
-            usd = 0 if usd is None else usd
-            allocated_total += await usd_value(token, (bal - avai))
+            # show zero balances if it is a gateway connector (the user manually
+            # chose to show those values with 'gateway connector-tokens')
+            if conn_setting.uses_gateway_generic_connector():
+                if bal == Decimal(0):
+                    allocated = "0%"
+                else:
+                    allocated = f"{(bal - avai) / bal:.0%}"
+            else:
+                # the exchange is CEX. Only show balance if non-zero.
+                if bal == Decimal(0):
+                    continue
+                allocated = f"{(bal - avai) / bal:.0%}"
+
+            rate = await RateOracle.get_instance().get_rate(base_token=token)
+            rate = Decimal("0") if rate is None else rate
+            global_value = rate * bal
+            allocated_total += rate * (bal - avai)
             rows.append({"Asset": token.upper(),
                          "Total": round(bal, 4),
-                         "Total ($)": round(usd),
+                         total_col_name: PerformanceMetrics.smart_round(global_value),
+                         "sum_not_for_show": global_value,
                          "Allocated": allocated,
                          })
-        df = pd.DataFrame(data=rows, columns=["Asset", "Total", "Total ($)", "Allocated"])
+        df = pd.DataFrame(data=rows, columns=["Asset", "Total", total_col_name, "sum_not_for_show", "Allocated"])
         df.sort_values(by=["Asset"], inplace=True)
         return df, allocated_total
 
@@ -156,20 +169,6 @@ class BalanceCommand:
         bals = CeloCLI.balances()
         for token, bal in bals.items():
             rows.append({"Asset": token.upper(), "Amount": round(bal.total, 4)})
-        df = pd.DataFrame(data=rows, columns=["Asset", "Amount"])
-        df.sort_values(by=["Asset"], inplace=True)
-        return df
-
-    async def ethereum_balances_df(self,  # type: HummingbotApplication
-                                   ):
-        rows = []
-        if ethereum_required_trading_pairs():
-            bals = await UserBalances.eth_n_erc20_balances()
-            for token, bal in bals.items():
-                rows.append({"Asset": token, "Amount": round(bal, 4)})
-        else:
-            eth_bal = UserBalances.ethereum_balance()
-            rows.append({"Asset": "ETH", "Amount": round(eth_bal, 4)})
         df = pd.DataFrame(data=rows, columns=["Asset", "Amount"])
         df.sort_values(by=["Asset"], inplace=True)
         return df
@@ -184,29 +183,30 @@ class BalanceCommand:
         df.sort_values(by=["Asset"], inplace=True)
         return df
 
-    async def show_asset_limits(self):
-        config_var = global_config_map["balance_asset_limit"]
-        exchange_limit_conf: Dict[str, Dict[str, str]] = config_var.value
+    async def show_asset_limits(
+        self  # type: HummingbotApplication
+    ):
+        exchange_limit_conf = self.client_config_map.balance_asset_limit
 
         if not any(list(exchange_limit_conf.values())):
-            self._notify("You have not set any limits.")
+            self.notify("You have not set any limits.")
             self.notify_balance_limit_set()
             return
 
-        self._notify("Balance Limits per exchange...")
+        self.notify("Balance Limits per exchange...")
 
         for exchange, asset_limit_config in exchange_limit_conf.items():
             if asset_limit_config is None:
                 continue
 
-            self._notify(f"\n{exchange}")
+            self.notify(f"\n{exchange}")
             df = await self.asset_limits_df(asset_limit_config)
             if df.empty:
-                self._notify("You have no limits on this exchange.")
+                self.notify("You have no limits on this exchange.")
             else:
                 lines = ["    " + line for line in df.to_string(index=False).split("\n")]
-                self._notify("\n".join(lines))
-        self._notify("\n")
+                self.notify("\n".join(lines))
+        self.notify("\n")
         return
 
     async def paper_acccount_balance_df(self, paper_balances: Dict[str, Decimal]):
@@ -218,24 +218,26 @@ class BalanceCommand:
         return df
 
     def notify_balance_limit_set(self):
-        self._notify("To set a balance limit (how much the bot can use): \n"
-                     "    balance limit [EXCHANGE] [ASSET] [AMOUNT]\n"
-                     "e.g. balance limit binance BTC 0.1")
+        self.notify("To set a balance limit (how much the bot can use): \n"
+                    "    balance limit [EXCHANGE] [ASSET] [AMOUNT]\n"
+                    "e.g. balance limit binance BTC 0.1")
 
     def notify_balance_paper_set(self):
-        self._notify("To set a paper account balance: \n"
-                     "    balance paper [ASSET] [AMOUNT]\n"
-                     "e.g. balance paper BTC 0.1")
+        self.notify("To set a paper account balance: \n"
+                    "    balance paper [ASSET] [AMOUNT]\n"
+                    "e.g. balance paper BTC 0.1")
 
-    async def show_paper_account_balance(self):
-        paper_balances = global_config_map["paper_trade_account_balance"].value
+    async def show_paper_account_balance(
+        self  # type: HummingbotApplication
+    ):
+        paper_balances = self.client_config_map.paper_trade.paper_trade_account_balance
         if not paper_balances:
-            self._notify("You have not set any paper account balance.")
+            self.notify("You have not set any paper account balance.")
             self.notify_balance_paper_set()
             return
-        self._notify("Paper account balances:")
+        self.notify("Paper account balances:")
         df = await self.paper_acccount_balance_df(paper_balances)
         lines = ["    " + line for line in df.to_string(index=False).split("\n")]
-        self._notify("\n".join(lines))
-        self._notify("\n")
+        self.notify("\n".join(lines))
+        self.notify("\n")
         return

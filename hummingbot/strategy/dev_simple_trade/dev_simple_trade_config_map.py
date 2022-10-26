@@ -1,18 +1,13 @@
-from hummingbot.client.config.config_var import ConfigVar
-from hummingbot.client.config.config_validators import (
-    validate_exchange,
-    validate_market_trading_pair,
-)
-from hummingbot.client.settings import (
-    required_exchanges,
-    EXAMPLE_PAIRS,
-)
 from typing import Optional
+
+from hummingbot.client.config.config_validators import validate_exchange, validate_market_trading_pair
+from hummingbot.client.config.config_var import ConfigVar
+from hummingbot.client.settings import AllConnectorSettings, required_exchanges
 
 
 def trading_pair_prompt():
     market = dev_simple_trade_config_map.get("market").value
-    example = EXAMPLE_PAIRS.get(market)
+    example = AllConnectorSettings.get_example_pairs().get(market)
     return "Enter the token trading pair you would like to trade on %s%s >>> " \
            % (market, f" (e.g. {example})" if example else "")
 
@@ -36,7 +31,7 @@ dev_simple_trade_config_map = {
         ConfigVar(key="market",
                   prompt="Enter the name of the exchange >>> ",
                   validator=validate_exchange,
-                  on_validated=lambda value: required_exchanges.append(value)),
+                  on_validated=lambda value: required_exchanges.add(value)),
     "market_trading_pair_tuple":
         ConfigVar(key="market_trading_pair_tuple",
                   prompt=trading_pair_prompt,
@@ -71,7 +66,7 @@ dev_simple_trade_config_map = {
                   type_str="decimal"),
     "cancel_order_wait_time":
         ConfigVar(key="cancel_order_wait_time",
-                  prompt="How long do you want to wait before cancelling your limit order (in seconds). "
+                  prompt="How long do you want to wait before canceling your limit order (in seconds). "
                          "(Default is 60 seconds) ? >>> ",
                   required_if=lambda: dev_simple_trade_config_map.get("order_type").value == "limit",
                   type_str="float",

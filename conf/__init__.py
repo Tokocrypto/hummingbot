@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 
-import os
-from hummingbot.client.config.global_config_map import connector_keys
-
 import logging as _logging
+import os
+
 _logger = _logging.getLogger(__name__)
 
 master_host = "***REMOVED***"
@@ -38,11 +37,11 @@ kafka_bootstrap_server = "***REMOVED***"
 # whether to enable api mocking in unit test cases
 mock_api_enabled = os.getenv("MOCK_API_ENABLED")
 
-# ALL TEST KEYS
-for key in connector_keys().keys():
-    locals()[key] = os.getenv(key.upper())
-
 """
+# AscendEX Tests
+ascend_ex_api_key = os.getenv("ASCEND_EX_KEY")
+ascend_ex_secret_key = os.getenv("ASCEND_EX_SECRET")
+
 # Binance Tests
 binance_api_key = os.getenv("BINANCE_API_KEY")
 binance_api_secret = os.getenv("BINANCE_API_SECRET")
@@ -61,10 +60,6 @@ coinbase_pro_passphrase = os.getenv("COINBASE_PRO_PASSPHRASE")
 huobi_api_key = os.getenv("HUOBI_API_KEY")
 huobi_secret_key = os.getenv("HUOBI_SECRET_KEY")
 
-# Dolomite Tests
-dolomite_test_web3_private_key = os.getenv("DOLOMITE_TEST_PK")
-dolomite_test_web3_address = os.getenv("DOLOMITE_TEST_ADDR")
-
 # Loopring Tests
 loopring_accountid = os.getenv("LOOPRING_ACCOUNTID")
 loopring_exchangeid = os.getenv("LOOPRING_EXCHANGEID")
@@ -82,6 +77,10 @@ kucoin_passphrase = os.getenv("KUCOIN_PASSPHRASE")
 
 test_web3_provider_list = [os.getenv("WEB3_PROVIDER")]
 
+# Latoken Tests
+latoken_api_key = os.getenv("LATOKEN_API_KEY")
+latoken_secret_key = os.getenv("LATOKEN_SECRET_KEY")
+
 # Liquid Tests
 liquid_api_key = os.getenv("LIQUID_API_KEY")
 liquid_secret_key = os.getenv("LIQUID_SECRET_KEY")
@@ -90,19 +89,44 @@ liquid_secret_key = os.getenv("LIQUID_SECRET_KEY")
 kraken_api_key = os.getenv("KRAKEN_API_KEY")
 kraken_secret_key = os.getenv("KRAKEN_SECRET_KEY")
 
-# Eterbase Test
-eterbase_api_key = os.getenv("ETERBASE_API_KEY")
-eterbase_secret_key = os.getenv("ETERBASE_SECRET_KEY")
-eterbase_account = os.getenv("ETERBASE_ACCOUNT")
+# OKX Test
+okx_api_key = os.getenv("OKX_API_KEY")
+okx_secret_key = os.getenv("OKX_SECRET_KEY")
+okx_passphrase = os.getenv("OKX_PASSPHRASE")
 
-# OKEx Test
-okex_api_key = os.getenv("OKEX_API_KEY")
-okex_secret_key = os.getenv("OKEX_SECRET_KEY")
-okex_passphrase = os.getenv("OKEX_PASSPHRASE")
+# BitMart Test
+bitmart_api_key = os.getenv("BITMART_API_KEY")
+bitmart_secret_key = os.getenv("BITMART_SECRET_KEY")
+bitmart_memo = os.getenv("BITMART_MEMO")
 
 # CryptoCom Test
 crypto_com_api_key = os.getenv("CRYPTO_COM_API_KEY")
 crypto_com_secret_key = os.getenv("CRYPTO_COM_SECRET_KEY")
+
+# HitBTC Tests
+hitbtc_api_key = os.getenv("HITBTC_API_KEY")
+hitbtc_secret_key = os.getenv("HITBTC_SECRET_KEY")
+
+# Gate.io Tests
+gate_io_api_key = os.getenv("GATE_IO_API_KEY")
+gate_io_secret_key = os.getenv("GATE_IO_SECRET_KEY")
+
+# CoinZoom Test
+coinzoom_api_key = os.getenv("COINZOOM_API_KEY")
+coinzoom_secret_key = os.getenv("COINZOOM_SECRET_KEY")
+coinzoom_username = os.getenv("COINZOOM_USERNAME")
+
+# Wazirx Test
+wazirx_api_key = os.getenv("WAZIRX_API_KEY")
+wazirx_secret_key = os.getenv("WAZIRX_SECRET_KEY")
+
+# AltMarkets.io Test
+altmarkets_api_key = os.getenv("ALTMARKETS_API_KEY")
+altmarkets_secret_key = os.getenv("ALTMARKETS_SECRET_KEY")
+
+# CoinFLEX Test
+coinflex_api_key = os.getenv("COINFLEX_API_KEY")
+coinflex_api_secret = os.getenv("COINFLEX_API_SECRET")
 
 # Wallet Tests
 test_erc20_token_address = os.getenv("TEST_ERC20_TOKEN_ADDRESS")
@@ -118,24 +142,3 @@ kafka_2 = {
     "bootstrap_servers": "***REMOVED***",
     "zookeeper_servers": "***REMOVED***"
 }
-
-
-try:
-    from .config_local import *             # noqa: F401, F403
-except ModuleNotFoundError:
-    pass
-
-try:
-    from .web3_wallet_secret import *       # noqa: F401, F403
-except ModuleNotFoundError:
-    pass
-
-try:
-    from .binance_secret import *           # noqa: F401, F403
-except ModuleNotFoundError:
-    pass
-
-try:
-    from .coinbase_pro_secrets import *     # noqa: F401, F403
-except ModuleNotFoundError:
-    pass

@@ -1,13 +1,21 @@
+"""
+Functions for generating keys and certificates
+"""
+from datetime import datetime, timedelta
 from os import listdir
 from os.path import join
-from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
+
 from cryptography import x509
-from cryptography.x509.oid import NameOID
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from hummingbot import cert_path
+from cryptography.x509.oid import NameOID
+
+from hummingbot.core.gateway import get_gateway_paths
+
+if TYPE_CHECKING:
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter
 
 CERT_SUBJECT = [
     x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'localhost'),
@@ -58,7 +66,7 @@ def generate_public_key(private_key, filepath):
     # Use subject as issuer on self-sign certificate
     cert_issuer = subject
 
-    # Set certifacation validity duration
+    # Set certification validity duration
     current_datetime = datetime.utcnow()
     expiration_datetime = current_datetime + timedelta(days=VALIDITY_DURATION)
 
@@ -162,30 +170,33 @@ client_cert_filename = 'client_cert.pem'
 client_csr_filename = 'client_csr.pem'
 
 
-def certs_files_exist() -> bool:
+def certs_files_exist(client_config_map: "ClientConfigAdapter") -> bool:
+    """
+    Check if the necessary key and certificate files exist
+    """
     required_certs = [ca_key_filename, ca_cert_filename,
                       server_key_filename, server_cert_filename,
                       client_key_filename, client_cert_filename]
 
-    file_list = listdir(cert_path())
+    file_list = listdir(get_gateway_paths(client_config_map).local_certs_path.as_posix())
     return all(elem in file_list for elem in required_certs)
 
 
-def create_self_sign_certs(pass_phase: str):
+def create_self_sign_certs(pass_phase: str, client_config_map: "ClientConfigAdapter"):
     """
     Create self-sign CA Cert
     """
-    CERT_FILE_PATH = cert_path()
+    cert_directory: str = get_gateway_paths(client_config_map).local_certs_path.as_posix()
 
     filepath_list = {
-        'ca_key': join(CERT_FILE_PATH, ca_key_filename),
-        'ca_cert': join(CERT_FILE_PATH, ca_cert_filename),
-        'server_key': join(CERT_FILE_PATH, server_key_filename),
-        'server_cert': join(CERT_FILE_PATH, server_cert_filename),
-        'server_csr': join(CERT_FILE_PATH, server_csr_filename),
-        'client_key': join(CERT_FILE_PATH, client_key_filename),
-        'client_cert': join(CERT_FILE_PATH, client_cert_filename),
-        'client_csr': join(CERT_FILE_PATH, client_csr_filename)
+        'ca_key': join(cert_directory, ca_key_filename),
+        'ca_cert': join(cert_directory, ca_cert_filename),
+        'server_key': join(cert_directory, server_key_filename),
+        'server_cert': join(cert_directory, server_cert_filename),
+        'server_csr': join(cert_directory, server_csr_filename),
+        'client_key': join(cert_directory, client_key_filename),
+        'client_cert': join(cert_directory, client_cert_filename),
+        'client_csr': join(cert_directory, client_csr_filename)
     }
 
     # Create CA Private & Public Keys for signing
@@ -197,8 +208,8 @@ def create_self_sign_certs(pass_phase: str):
     # Create CSR
     generate_csr(server_private_key, filepath_list['server_csr'])
     # Load CSR
-    server_csr_file = open(filepath_list['server_csr'], 'rb')
-    server_csr = x509.load_pem_x509_csr(server_csr_file.read(), default_backend())
+    with open(filepath_list['server_csr'], 'rb') as server_csr_file:
+        server_csr = x509.load_pem_x509_csr(server_csr_file.read(), default_backend())
 
     # Create Client CSR
     # local certificate must be unencrypted. Currently, Requests does not support using encrypted keys.
@@ -206,19 +217,19 @@ def create_self_sign_certs(pass_phase: str):
     # Create CSR
     generate_csr(client_private_key, filepath_list['client_csr'])
     # Load CSR
-    client_csr_file = open(filepath_list['client_csr'], 'rb')
-    client_csr = x509.load_pem_x509_csr(client_csr_file.read(), default_backend())
+    with open(filepath_list['client_csr'], 'rb') as client_csr_file:
+        client_csr = x509.load_pem_x509_csr(client_csr_file.read(), default_backend())
 
     # Load CA public key
-    ca_cert_file = open(filepath_list['ca_cert'], 'rb')
-    ca_cert = x509.load_pem_x509_certificate(ca_cert_file.read(), default_backend())
+    with open(filepath_list['ca_cert'], 'rb') as ca_cert_file:
+        ca_cert = x509.load_pem_x509_certificate(ca_cert_file.read(), default_backend())
     # Load CA private key
-    ca_key_file = open(filepath_list['ca_key'], 'rb')
-    ca_key = serialization.load_pem_private_key(
-        ca_key_file.read(),
-        pass_phase.encode('utf-8'),
-        default_backend(),
-    )
+    with open(filepath_list['ca_key'], 'rb') as ca_key_file:
+        ca_key = serialization.load_pem_private_key(
+            ca_key_file.read(),
+            pass_phase.encode('utf-8'),
+            default_backend(),
+        )
 
     # Sign Server Cert with CSR
     sign_csr(server_csr, ca_cert, ca_key, filepath_list['server_cert'])
