@@ -316,14 +316,6 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         self._filled_order_delay = value
 
     @property
-    def filled_order_delay(self) -> float:
-        return self._filled_order_delay
-
-    @filled_order_delay.setter
-    def filled_order_delay(self, value: float):
-        self._filled_order_delay = value
-
-    @property
     def add_transaction_costs_to_orders(self) -> bool:
         return self._add_transaction_costs_to_orders
 
@@ -669,7 +661,8 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         # append inventory skew stats.
         if self._inventory_skew_enabled:
             inventory_skew_df = map_df_to_str(self.inventory_skew_stats_data_frame())
-            assets_df = assets_df.append(inventory_skew_df)
+            assets_df = pd.concat(
+                [assets_df, inventory_skew_df], join="inner")
 
         first_col_length = max(*assets_df[0].apply(len))
         df_lines = assets_df.to_string(index=False, header=False,

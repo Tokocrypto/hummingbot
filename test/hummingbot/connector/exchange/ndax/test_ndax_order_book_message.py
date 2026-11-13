@@ -1,8 +1,7 @@
 import time
-
 from unittest import TestCase
 
-from hummingbot.connector.exchange.ndax.ndax_order_book_message import NdaxOrderBookMessage, NdaxOrderBookEntry
+from hummingbot.connector.exchange.ndax.ndax_order_book_message import NdaxOrderBookEntry, NdaxOrderBookMessage
 from hummingbot.core.data_type.order_book_message import OrderBookMessageType
 
 

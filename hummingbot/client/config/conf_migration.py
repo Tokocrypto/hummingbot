@@ -18,10 +18,6 @@ from hummingbot.client.config.client_config_map import (
     DBSqliteMode,
     KillSwitchDisabledMode,
     KillSwitchEnabledMode,
-    PMMScriptDisabledMode,
-    PMMScriptEnabledMode,
-    TelegramDisabledMode,
-    TelegramEnabledMode,
 )
 from hummingbot.client.config.config_crypt import BaseSecretsManager, store_password_verification
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
@@ -39,7 +35,6 @@ encrypted_conf_prefix = "encrypted_"
 encrypted_conf_postfix = ".json"
 conf_dir_path = CONF_DIR_PATH
 strategies_conf_dir_path = STRATEGIES_CONF_DIR_PATH
-celo_address = None
 
 
 def migrate_configs(secrets_manager: BaseSecretsManager) -> List[str]:
@@ -90,8 +85,6 @@ def backup_existing_dir() -> List[str]:
 
 
 def migrate_global_config() -> List[str]:
-    global celo_address
-
     logging.getLogger().info("\nMigrating the global config...")
     global_config_path = CONF_DIR_PATH / "conf_global.yml"
     errors = []
@@ -103,14 +96,12 @@ def migrate_global_config() -> List[str]:
         _migrate_global_config_modes(client_config_map, data)
         data.pop("kraken_api_tier", None)
         data.pop("key_file_path", None)
-        celo_address = data.pop("celo_address", None)
         keys = list(data.keys())
         for key in keys:
             if key in client_config_map.keys():
                 _migrate_global_config_field(client_config_map, data, key)
         for key in data:
             logging.getLogger().warning(f"Global ConfigVar {key} was not migrated.")
-        errors.extend(client_config_map.validate_model())
         if len(errors) == 0:
             save_to_yml(CLIENT_CONFIG_PATH, client_config_map)
             global_config_path.unlink()
@@ -137,18 +128,6 @@ def _migrate_global_config_modes(client_config_map: ClientConfigAdapter, data: D
     _migrate_global_config_field(
         client_config_map.paper_trade, data, "paper_trade_account_balance"
     )
-
-    telegram_enabled = data.pop("telegram_enabled")
-    telegram_token = data.pop("telegram_token")
-    telegram_chat_id = data.pop("telegram_chat_id")
-    if telegram_enabled:
-        client_config_map.telegram_mode = TelegramEnabledMode(
-            telegram_token=telegram_token,
-            telegram_chat_id=telegram_chat_id,
-        )
-    else:
-        client_config_map.telegram_mode = TelegramDisabledMode()
-
     db_engine = data.pop("db_engine")
     db_host = data.pop("db_host")
     db_port = data.pop("db_port")
@@ -167,18 +146,39 @@ def _migrate_global_config_modes(client_config_map: ClientConfigAdapter, data: D
             db_name=db_name,
         )
 
-    pmm_script_enabled = data.pop("pmm_script_enabled")
-    pmm_script_file_path = data.pop("pmm_script_file_path")
-    if pmm_script_enabled:
-        client_config_map.pmm_script_mode = PMMScriptEnabledMode(pmm_script_file_path=pmm_script_file_path)
-    else:
-        client_config_map.pmm_script_mode = PMMScriptDisabledMode()
-
-    _migrate_global_config_field(
-        client_config_map.gateway, data, "gateway_api_host"
-    )
     _migrate_global_config_field(
         client_config_map.gateway, data, "gateway_api_port"
+    )
+
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_host"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_port"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_username"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_password"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_ssl"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_logger"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_notifier"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_commands"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_events"
+    )
+    _migrate_global_config_field(
+        client_config_map.mqtt_bridge, data, "mqtt_autostart"
     )
 
     anonymized_metrics_enabled = data.pop("anonymized_metrics_enabled")
@@ -398,9 +398,6 @@ def _maybe_migrate_encrypted_confs(config_keys: BaseConnectorConfigMap) -> List[
     missing_fields = []
     for el in cm.traverse():
         if el.client_field_data is not None:
-            if el.attr == "celo_address" and celo_address is not None:
-                cm.setattr_no_validation(el.attr, celo_address)
-                continue
             key_path = conf_dir_path / f"{encrypted_conf_prefix}{el.attr}{encrypted_conf_postfix}"
             if key_path.exists():
                 with open(key_path, 'r') as f:
@@ -417,11 +414,6 @@ def _maybe_migrate_encrypted_confs(config_keys: BaseConnectorConfigMap) -> List[
     if found_one:
         if len(missing_fields) != 0:
             errors = [f"{config_keys.connector} - missing fields: {missing_fields}"]
-        if len(errors) == 0:
-            errors = cm.validate_model()
-        if errors:
-            errors = [f"{config_keys.connector} - {e}" for e in errors]
-            logging.getLogger().error(f"The migration of {config_keys.connector} failed with errors: {errors}")
         else:
             Security.update_secure_config(cm)
             logging.getLogger().info(f"Migrated secure keys for {config_keys.connector}")

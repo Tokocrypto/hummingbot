@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 from prompt_toolkit.utils import is_windows
 
+from hummingbot.client.command.gateway_command import GatewayCommand
 from hummingbot.client.config.config_helpers import (
     ClientConfigAdapter,
     missing_required_configs_legacy,
@@ -27,7 +28,7 @@ from hummingbot.strategy.pure_market_making import PureMarketMakingStrategy
 from hummingbot.user.user_balances import UserBalances
 
 if TYPE_CHECKING:
-    from hummingbot.client.hummingbot_application import HummingbotApplication
+    from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
 
 no_restart_pmm_keys_in_percentage = ["bid_spread", "ask_spread", "order_level_spread", "inventory_target_base_pct"]
 no_restart_pmm_keys = ["order_amount",
@@ -41,33 +42,51 @@ no_restart_pmm_keys = ["order_amount",
                        "price_ceiling_pct",
                        "price_floor_pct",
                        "price_band_refresh_time"
+                       "order_optimization_enabled",
+                       "bid_order_optimization_depth",
+                       "ask_order_optimization_depth"
                        ]
 client_configs_to_display = ["autofill_import",
                              "kill_switch_mode",
                              "kill_switch_rate",
-                             "telegram_mode",
-                             "telegram_token",
-                             "telegram_chat_id",
+                             "mqtt_bridge",
+                             "mqtt_host",
+                             "mqtt_port",
+                             "mqtt_namespace",
+                             "mqtt_username",
+                             "mqtt_password",
+                             "mqtt_ssl",
+                             "mqtt_logger",
+                             "mqtt_notifier",
+                             "mqtt_commands",
+                             "mqtt_events",
+                             "mqtt_external_events",
+                             "mqtt_autostart",
+                             "instance_id",
                              "send_error_logs",
-                             "pmm_script_mode",
-                             "pmm_script_file_path",
                              "ethereum_chain_name",
                              "gateway",
-                             "gateway_enabled",
-                             "gateway_cert_passphrase",
                              "gateway_api_host",
                              "gateway_api_port",
+                             "gateway_use_ssl",
                              "rate_oracle_source",
                              "extra_tokens",
+                             "fetch_pairs_from_all_exchanges",
                              "global_token",
                              "global_token_name",
                              "global_token_symbol",
+                             "usd_equivalent_tokens",
                              "rate_limits_share_pct",
                              "commands_timeout",
                              "create_command_timeout",
                              "other_commands_timeout",
                              "tables_format",
-                             "tick_size"]
+                             "tick_size",
+                             "market_data_collection",
+                             "market_data_collection_enabled",
+                             "market_data_collection_interval",
+                             "market_data_collection_depth",
+                             ]
 color_settings_to_display = ["top_pane",
                              "bottom_pane",
                              "output_pane",
@@ -97,7 +116,7 @@ class ConfigCommand:
         self.list_strategy_configs()
 
     def list_client_configs(
-        self  # type: HummingbotApplication
+            self,  # type: HummingbotApplication
     ):
         data = self.build_model_df_data(self.client_config_map, to_print=client_configs_to_display)
         df = map_df_to_str(pd.DataFrame(data=data, columns=columns))
@@ -118,7 +137,7 @@ class ConfigCommand:
         self.notify("\n".join(lines))
 
     def list_strategy_configs(
-        self  # type: HummingbotApplication
+            self,  # type: HummingbotApplication
     ):
         if self.strategy_name is not None:
             config_map = self.strategy_config_map
@@ -132,18 +151,19 @@ class ConfigCommand:
             self.notify("\n".join(lines))
 
     def build_df_data_from_config_map(
-        self,  # type: HummingbotApplication
-        config_map: Union[ClientConfigAdapter, Dict[str, ConfigVar]]
+            self,  # type: HummingbotApplication
+            config_map: Union[ClientConfigAdapter, Dict[str, ConfigVar]]
     ) -> List[Tuple[str, Any]]:
         if isinstance(config_map, ClientConfigAdapter):
             data = self.build_model_df_data(config_map)
         else:  # legacy
-            data = [[cv.printable_key or cv.key, cv.value] for cv in self.strategy_config_map.values() if not cv.is_secure]
+            data = [[cv.printable_key or cv.key, cv.value] for cv in self.strategy_config_map.values() if
+                    not cv.is_secure]
         return data
 
     @staticmethod
     def build_model_df_data(
-        config_map: ClientConfigAdapter, to_print: Optional[List[str]] = None
+            config_map: ClientConfigAdapter, to_print: Optional[List[str]] = None
     ) -> List[Tuple[str, Any]]:
         model_data = []
         for traversal_item in config_map.traverse():
@@ -157,7 +177,7 @@ class ConfigCommand:
             model_data.append((attr_printout, traversal_item.printable_value))
         return model_data
 
-    def configurable_keys(self  # type: HummingbotApplication
+    def configurable_keys(self,  # type: HummingbotApplication
                           ) -> List[str]:
         """
         Returns a list of configurable keys - using config command, excluding exchanges api keys
@@ -166,23 +186,19 @@ class ConfigCommand:
         keys = [
             traversal_item.config_path
             for traversal_item in self.client_config_map.traverse()
-            if (
-                traversal_item.client_field_data is not None
-                and traversal_item.client_field_data.prompt is not None
-            )
+            if (traversal_item.client_field_data is not None and traversal_item.client_field_data.prompt is not None)
         ]
         if self.strategy_config_map is not None:
             if isinstance(self.strategy_config_map, ClientConfigAdapter):
                 keys.extend([
                     traversal_item.config_path
                     for traversal_item in self.strategy_config_map.traverse()
-                    if (
-                        traversal_item.client_field_data is not None
-                        and traversal_item.client_field_data.prompt is not None
-                    )
+                    if (traversal_item.client_field_data is not None
+                        and traversal_item.client_field_data.prompt is not None)
                 ])
             else:  # legacy
-                keys.extend([c.key for c in self.strategy_config_map.values() if c.prompt is not None and c.key != 'strategy'])
+                keys.extend(
+                    [c.key for c in self.strategy_config_map.values() if c.prompt is not None and c.key != 'strategy'])
         return keys
 
     async def check_password(self,  # type: HummingbotApplication
@@ -218,8 +234,8 @@ class ConfigCommand:
 
         try:
             if (
-                not isinstance(self.strategy_config_map, (type(None), ClientConfigAdapter))
-                and key in self.strategy_config_map
+                    not isinstance(self.strategy_config_map, (type(None), ClientConfigAdapter))
+                    and key in self.strategy_config_map
             ):
                 await self._config_single_key_legacy(key, input_value)
             else:
@@ -227,12 +243,17 @@ class ConfigCommand:
                 if client_config_key:
                     config_map = self.client_config_map
                     file_path = CLIENT_CONFIG_PATH
-                elif self.strategy is not None:
+                elif self.trading_core.strategy is not None:
                     self.notify("Configuring the strategy while it is running is not currently supported.")
                     return
                 else:
                     config_map = self.strategy_config_map
-                    file_path = STRATEGIES_CONF_DIR_PATH / self.strategy_file_name
+                    if self.strategy_file_name is not None:
+                        file_path = STRATEGIES_CONF_DIR_PATH / self.strategy_file_name
+                    else:
+                        self.notify("Strategy file name is not configured.")
+                        return
+
                 if input_value is None:
                     self.notify("Please follow the prompt to complete configurations: ")
                 if key == "inventory_target_base_pct":
@@ -250,7 +271,7 @@ class ConfigCommand:
                     self.list_client_configs()
                 else:
                     self.list_strategy_configs()
-                self.app.app.style = load_style(self.client_config_map)
+                self.app.style = load_style(self.client_config_map)
         except asyncio.TimeoutError:
             self.logger().error("Prompt timeout")
         except Exception as err:
@@ -261,9 +282,9 @@ class ConfigCommand:
             self.app.change_prompt(prompt=">>> ")
 
     async def _config_single_key_legacy(
-        self,  # type: HummingbotApplication
-        key: str,
-        input_value: Any,
+            self,  # type: HummingbotApplication
+            key: str,
+            input_value: Any,
     ):  # pragma: no cover
         config_var, config_map, file_path = None, None, None
         if self.strategy_config_map is not None and key in self.strategy_config_map:
@@ -296,12 +317,12 @@ class ConfigCommand:
         for config in missings:
             self.notify(f"{config.key}: {str(config.value)}")
         if (
-            isinstance(self.strategy, PureMarketMakingStrategy) or
-            isinstance(self.strategy, PerpetualMarketMakingStrategy)
+                isinstance(self.trading_core.strategy, PureMarketMakingStrategy) or
+                isinstance(self.trading_core.strategy, PerpetualMarketMakingStrategy)
         ):
-            updated = ConfigCommand.update_running_mm(self.strategy, key, config_var.value)
+            updated = ConfigCommand.update_running_mm(self.trading_core.strategy, key, config_var.value)
             if updated:
-                self.notify(f"\nThe current {self.strategy_name} strategy has been updated "
+                self.notify(f"\nThe current {self.trading_core.strategy_name} strategy has been updated "
                             f"to reflect the new configuration.")
 
     async def _prompt_missing_configs(self,  # type: HummingbotApplication
@@ -317,9 +338,9 @@ class ConfigCommand:
         return missings
 
     async def asset_ratio_maintenance_prompt(
-        self,  # type: HummingbotApplication
-        config_map: BaseTradingStrategyConfigMap,
-        input_value: Any = None,
+            self,  # type: HummingbotApplication
+            config_map: BaseTradingStrategyConfigMap,
+            input_value: Any = None,
     ):  # pragma: no cover
         if input_value:
             config_map.inventory_target_base_pct = input_value
@@ -327,7 +348,10 @@ class ConfigCommand:
             exchange = config_map.exchange
             market = config_map.market
             base, quote = split_hb_trading_pair(market)
-            balances = await UserBalances.instance().balances(exchange, config_map, base, quote)
+            if UserBalances.instance().is_gateway_market(exchange):
+                balances = await GatewayCommand.balance(self, exchange, config_map, base, quote)
+            else:
+                balances = await UserBalances.instance().balances(exchange, config_map, base, quote)
             if balances is None:
                 return
             base_ratio = await UserBalances.base_amount_ratio(exchange, market, balances)
@@ -354,9 +378,9 @@ class ConfigCommand:
                 await self.prompt_a_config(config_map, config="inventory_target_base_pct")
 
     async def asset_ratio_maintenance_prompt_legacy(
-        self,  # type: HummingbotApplication
-        config_map,
-        input_value=None,
+            self,  # type: HummingbotApplication
+            config_map,
+            input_value=None,
     ):
         if input_value:
             config_map['inventory_target_base_pct'].value = Decimal(input_value)
@@ -364,7 +388,10 @@ class ConfigCommand:
             exchange = config_map['exchange'].value
             market = config_map["market"].value
             base, quote = market.split("-")
-            balances = await UserBalances.instance().balances(exchange, config_map, base, quote)
+            if UserBalances.instance().is_gateway_market(exchange):
+                balances = await GatewayCommand.balance(self, exchange, config_map, base, quote)
+            else:
+                balances = await UserBalances.instance().balances(exchange, config_map, base, quote)
             if balances is None:
                 return
             base_ratio = await UserBalances.base_amount_ratio(exchange, market, balances)
@@ -393,9 +420,9 @@ class ConfigCommand:
                 await self.prompt_a_config_legacy(config_map["inventory_target_base_pct"])
 
     async def inventory_price_prompt(
-        self,  # type: HummingbotApplication
-        model: BaseTradingStrategyConfigMap,
-        input_value=None,
+            self,  # type: HummingbotApplication
+            model: BaseTradingStrategyConfigMap,
+            input_value=None,
     ):
         """
         Not currently used.
@@ -403,9 +430,9 @@ class ConfigCommand:
         raise NotImplementedError
 
     async def inventory_price_prompt_legacy(
-        self,  # type: HummingbotApplication
-        config_map,
-        input_value=None,
+            self,  # type: HummingbotApplication
+            config_map,
+            input_value=None,
     ):
         key = "inventory_price"
         if input_value:
@@ -417,6 +444,8 @@ class ConfigCommand:
 
             if exchange.endswith("paper_trade"):
                 balances = self.client_config_map.paper_trade.paper_trade_account_balance
+            elif UserBalances.instance().is_gateway_market(exchange):
+                balances = await GatewayCommand.balance(self, exchange, config_map, base_asset, quote_asset)
             else:
                 balances = await UserBalances.instance().balances(
                     exchange, base_asset, quote_asset
@@ -427,7 +456,7 @@ class ConfigCommand:
             cvar = ConfigVar(
                 key="temp_config",
                 prompt=f"On {exchange}, you have {balances[base_asset]:.4f} {base_asset}. "
-                f"What was the price for this amount in {quote_asset}?  >>> ",
+                       f"What was the price for this amount in {quote_asset}?  >>> ",
                 required_if=lambda: True,
                 type_str="decimal",
                 validator=lambda v: validate_decimal(
@@ -444,7 +473,7 @@ class ConfigCommand:
                 self.notify("Inventory price not updated due to bad input")
                 return
 
-            with self.trade_fill_db.get_new_session() as session:
+            with self.trading_core.trade_fill_db.get_new_session() as session:
                 with session.begin():
                     InventoryCost.add_volume(
                         session,

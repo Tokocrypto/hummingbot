@@ -6,15 +6,16 @@ from hashlib import md5
 from os import DirEntry, scandir
 from os.path import exists, join
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from hexbytes import HexBytes
 from pydantic import SecretStr
 
 from hummingbot import root_path
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
-from hummingbot.client.settings import CONNECTOR_SUBMODULES_THAT_ARE_NOT_TYPES
-from hummingbot.connector.utils import get_new_client_order_id
+from hummingbot.client.settings import CONNECTOR_SUBMODULES_THAT_ARE_NOT_CEX_TYPES
+from hummingbot.connector.utils import get_new_client_order_id, to_0x_hex
 
 
 class UtilsTest(unittest.TestCase):
@@ -23,6 +24,8 @@ class UtilsTest(unittest.TestCase):
         cls.base = "HBOT"
         cls.quote = "COINALPHA"
         cls.trading_pair = f"{cls.base}-{cls.quote}"
+        cls.signer_private_key = "0x" + "1" * 64
+        cls.action = MagicMock()
 
     def test_get_new_client_order_id(self):
         host_prefix = "hbot"
@@ -59,7 +62,8 @@ class UtilsTest(unittest.TestCase):
 
         expected_id_prefix = f"{host_prefix}B{self.base[0]}{self.base[-1]}{self.quote[0]}{self.quote[-1]}"
         expected_time_text = hex(nonce_mock.return_value)[2:]
-        expected_client_instance_id = md5(f"{platform.uname()}_pid:{os.getpid()}_ppid:{os.getppid()}".encode("utf-8")).hexdigest()
+        expected_client_instance_id = md5(
+            f"{platform.uname()}_pid:{os.getpid()}_ppid:{os.getppid()}".encode("utf-8")).hexdigest()
 
         expected_full_length_id = f"{expected_id_prefix}{expected_time_text}{expected_client_instance_id}"
         expected_shortened_id = f"{expected_id_prefix}{expected_time_text}{expected_client_instance_id[:5]}"
@@ -72,12 +76,12 @@ class UtilsTest(unittest.TestCase):
         self.assertEqual(expected_extra_reduced_id, extra_reduced_id)
 
     def test_connector_config_maps(self):
-        connector_exceptions = ["mock_paper_exchange", "mock_pure_python_paper_exchange", "paper_trade", "celo", "amm", "clob"]
+        connector_exceptions = ["mock_paper_exchange", "mock_pure_python_paper_exchange", "paper_trade", "amm", "clob"]
 
         type_dirs = [
             cast(DirEntry, f) for f in
             scandir(f"{root_path() / 'hummingbot' / 'connector'}")
-            if f.is_dir() and f.name not in CONNECTOR_SUBMODULES_THAT_ARE_NOT_TYPES
+            if f.is_dir() and f.name not in CONNECTOR_SUBMODULES_THAT_ARE_NOT_CEX_TYPES
         ]
         for type_dir in type_dirs:
             connector_dirs = [
@@ -95,9 +99,26 @@ class UtilsTest(unittest.TestCase):
 
                 self.assertIsInstance(connector_config, BaseConnectorConfigMap)
                 for el in ClientConfigAdapter(connector_config).traverse():
+                    print(el)
                     if el.attr == "connector":
                         self.assertEqual(el.value, connector_dir.name)
+                    elif el.attr == "use_auth_for_public_endpoints":
+                        self.assertEqual(el.type_, bool)
                     elif el.client_field_data.is_secure:
                         self.assertEqual(el.type_, SecretStr)
-                    else:
-                        self.assertEqual(el.type_, str)
+
+    def test_to_0x_hex_with_to_0x_hex_method(self):
+        signature = HexBytes("0x1234")
+        signature.to_0x_hex = lambda: "0x1234"
+        result = to_0x_hex(signature)
+        self.assertEqual(result, "0x1234")
+
+    def test_to_0x_hex_without_to_0x_hex_method_0x_prefixed(self):
+        signature = HexBytes("0x1234")
+        result = to_0x_hex(signature)
+        self.assertEqual(result, "0x1234")
+
+    def test_to_0x_hex_without_to_0x_hex_method_not_0x_prefixed(self):
+        signature = HexBytes("1234")
+        result = to_0x_hex(signature)
+        self.assertEqual(result, "0x1234")

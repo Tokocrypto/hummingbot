@@ -65,7 +65,7 @@ class HummingbotCLI(PubSub):
         self.log_field = create_log_field(self.search_field)
         self.right_pane_toggle = create_log_toggle(self.toggle_right_pane)
         self.live_field = create_live_field()
-        self.log_field_button = create_tab_button("Log-pane", self.log_button_clicked)
+        self.log_field_button = create_tab_button("logs", self.log_button_clicked)
         self.timer = create_timer()
         self.process_usage = create_process_monitor()
         self.trade_monitor = create_trade_monitor()
@@ -182,10 +182,10 @@ class HummingbotCLI(PubSub):
     def toggle_right_pane(self):
         if self.layout_components["pane_right"].filter():
             self.layout_components["pane_right"].filter = lambda: False
-            self.layout_components["item_top_toggle"].text = '< log pane'
+            self.layout_components["item_top_toggle"].text = '< Ctrl+T'
         else:
             self.layout_components["pane_right"].filter = lambda: True
-            self.layout_components["item_top_toggle"].text = '> log pane'
+            self.layout_components["item_top_toggle"].text = '> Ctrl+T'
 
     def log_button_clicked(self):
         for tab in self.command_tabs.values():

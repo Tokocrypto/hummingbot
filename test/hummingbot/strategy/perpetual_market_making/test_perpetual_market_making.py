@@ -5,8 +5,6 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from hummingbot.client.config.client_config_map import ClientConfigMap
-from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
@@ -56,9 +54,7 @@ class PerpetualMarketMakingTests(TestCase):
     def setUp(self):
         super().setUp()
         self.log_records = []
-        self.market: MockPerpConnector = MockPerpConnector(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=self.trade_fee_schema)
+        self.market: MockPerpConnector = MockPerpConnector(trade_fee_schema=self.trade_fee_schema)
         self.market.set_quantization_param(
             QuantizationParams(
                 self.trading_pair,
@@ -743,7 +739,7 @@ class PerpetualMarketMakingTests(TestCase):
                            "\n\n  No active maker orders."
                            "\n\n  Positions:"
                            "\n            Symbol Type Entry Price Amount Leverage Unrealized PnL"
-                           "\n    COINALPHA-HBOT LONG      100.50      1       10           0.00")
+                           "\n    COINALPHA-HBOT LONG      100.50      1       10           1000")
         status = self.strategy.format_status()
 
         self.assertEqual(expected_status, status)

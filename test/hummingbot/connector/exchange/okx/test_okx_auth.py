@@ -1,9 +1,10 @@
 import asyncio
 import base64
+import datetime
 import hashlib
 import hmac
 import json
-from datetime import datetime
+from datetime import timezone
 from typing import Awaitable
 from unittest import TestCase
 from unittest.mock import MagicMock
@@ -43,7 +44,8 @@ class OkxAuthTests(TestCase):
         return signed_message.decode("utf-8")
 
     def _format_timestamp(self, timestamp: int) -> str:
-        return datetime.utcfromtimestamp(timestamp).isoformat(timespec="milliseconds") + 'Z'
+        ts = datetime.datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds")
+        return ts.replace('+00:00', 'Z')
 
     def test_add_auth_headers_to_get_request_without_params(self):
         request = RESTRequest(
@@ -59,6 +61,25 @@ class OkxAuthTests(TestCase):
         self.assertEqual(self.api_key, request.headers["OK-ACCESS-KEY"])
         self.assertEqual(expected_timestamp, request.headers["OK-ACCESS-TIMESTAMP"])
         expected_signature = self._sign(expected_timestamp + "GET" + request.throttler_limit_id, key=self.secret_key)
+        self.assertEqual(expected_signature, request.headers["OK-ACCESS-SIGN"])
+        expected_passphrase = self.passphrase
+        self.assertEqual(expected_passphrase, request.headers["OK-ACCESS-PASSPHRASE"])
+
+    def test_add_auth_headers_to_get_request_with_params(self):
+        request = RESTRequest(
+            method=RESTMethod.GET,
+            url="https://test.url/api/endpoint",
+            params = {'ordId': '123', 'instId': 'BTC-USDT'},
+            is_auth_required=True,
+            throttler_limit_id="/api/endpoint"
+        )
+
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+
+        expected_timestamp = self._format_timestamp(timestamp=1000)
+        self.assertEqual(self.api_key, request.headers["OK-ACCESS-KEY"])
+        self.assertEqual(expected_timestamp, request.headers["OK-ACCESS-TIMESTAMP"])
+        expected_signature = self._sign(expected_timestamp + "GET" + f"{request.throttler_limit_id}?ordId=123&instId=BTC-USDT", key=self.secret_key)
         self.assertEqual(expected_signature, request.headers["OK-ACCESS-SIGN"])
         expected_passphrase = self.passphrase
         self.assertEqual(expected_passphrase, request.headers["OK-ACCESS-PASSPHRASE"])

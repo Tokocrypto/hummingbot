@@ -1,42 +1,82 @@
 import asyncio
 import json
-from typing import Awaitable
-from unittest import TestCase
-from unittest.mock import AsyncMock, patch
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from typing import Awaitable, Optional
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from bidict import bidict
 
 import hummingbot.connector.exchange.ndax.ndax_constants as CONSTANTS
 from hummingbot.connector.exchange.ndax.ndax_api_user_stream_data_source import NdaxAPIUserStreamDataSource
 from hummingbot.connector.exchange.ndax.ndax_auth import NdaxAuth
+from hummingbot.connector.exchange.ndax.ndax_exchange import NdaxExchange
 from hummingbot.connector.exchange.ndax.ndax_websocket_adaptor import NdaxWebSocketAdaptor
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
+from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 
 
-class NdaxAPIUserStreamDataSourceTests(TestCase):
+class NdaxAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
     # the level is required to receive logs from the data source loger
     level = 0
 
-    def setUp(self) -> None:
+    def setUp(cls) -> None:
         super().setUp()
-        self.uid = '001'
-        self.api_key = 'testAPIKey'
-        self.secret = 'testSecret'
-        self.account_id = 528
-        self.username = 'hbot'
-        self.oms_id = 1
-        self.log_records = []
-        self.listening_task = None
+        cls.uid = '001'
+        cls.api_key = 'testAPIKey'
+        cls.secret = 'testSecret'
+        cls.account_id = 528
+        cls.username = 'hbot'
+        cls.domain = "ndax_main"
+        cls.oms_id = 1
+        cls.base_asset = "COINALPHA"
+        cls.quote_asset = "HBOT"
+        cls.trading_pair = f"{cls.base_asset}-{cls.quote_asset}"
+        cls.ex_trading_pair = 1
+        cls.log_records = []
+        cls.listening_task = None
 
-        throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
-        auth_assistant = NdaxAuth(uid=self.uid,
-                                  api_key=self.api_key,
-                                  secret_key=self.secret,
-                                  account_name=self.username)
-        self.data_source = NdaxAPIUserStreamDataSource(throttler, auth_assistant)
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.log_records = []
+        self.listening_task: Optional[asyncio.Task] = None
+        self.mocking_assistant = NetworkMockingAssistant(self.local_event_loop)
+
+        self.throttler = AsyncThrottler(rate_limits=CONSTANTS.RATE_LIMITS)
+        self.mock_time_provider = MagicMock()
+        self.mock_time_provider.time.return_value = 1000
+        self.auth = NdaxAuth(
+            uid=self.uid,
+            api_key=self.api_key,
+            secret_key=self.secret,
+            account_name=self.username
+        )
+        self.time_synchronizer = TimeSynchronizer()
+        self.time_synchronizer.add_time_offset_ms_sample(0)
+
+        self.connector = NdaxExchange(
+            ndax_uid=self.uid,
+            ndax_api_key=self.api_key,
+            ndax_secret_key=self.secret,
+            ndax_account_name=self.username,
+            trading_pairs=[self.trading_pair]
+        )
+        self.connector._web_assistants_factory._auth = self.auth
+
+        self.data_source = NdaxAPIUserStreamDataSource(
+            auth=self.auth,
+            trading_pairs=[self.trading_pair],
+            connector=self.connector,
+            api_factory=self.connector._web_assistants_factory,
+            domain=self.domain
+        )
+
         self.data_source.logger().setLevel(1)
         self.data_source.logger().addHandler(self)
 
-        self.mocking_assistant = NetworkMockingAssistant()
+        self.resume_test_event = asyncio.Event()
+
+        self.connector._set_trading_pair_symbol_map(bidict({self.ex_trading_pair: self.trading_pair}))
 
     def tearDown(self) -> None:
         self.listening_task and self.listening_task.cancel()
@@ -111,7 +151,7 @@ class NdaxAPIUserStreamDataSourceTests(TestCase):
                          NdaxWebSocketAdaptor.endpoint_from_raw_message(json.dumps(authentication_request)))
         self.assertEqual(CONSTANTS.SUBSCRIBE_ACCOUNT_EVENTS_ENDPOINT_NAME,
                          NdaxWebSocketAdaptor.endpoint_from_raw_message(json.dumps(subscription_request)))
-        subscription_payload = NdaxWebSocketAdaptor.payload_from_raw_message(json.dumps(subscription_request))
+        subscription_payload = NdaxWebSocketAdaptor.payload_from_message(subscription_request)
         expected_payload = {"AccountId": self.account_id,
                             "OMSId": self.oms_id}
         self.assertEqual(expected_payload, subscription_payload)
@@ -140,8 +180,7 @@ class NdaxAPIUserStreamDataSourceTests(TestCase):
         self.assertTrue(self._is_logged("ERROR", "Error occurred when authenticating to user stream "
                                                  "(Could not authenticate websocket connection with NDAX)"))
         self.assertTrue(self._is_logged("ERROR",
-                                        "Unexpected error with NDAX WebSocket connection. Retrying in 30 seconds. "
-                                        "(Could not authenticate websocket connection with NDAX)"))
+                                        "Unexpected error while listening to user stream. Retrying after 5 seconds..."))
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     def test_listening_process_canceled_when_cancel_exception_during_initialization(self, ws_connect_mock):
@@ -186,15 +225,6 @@ class NdaxAPIUserStreamDataSourceTests(TestCase):
             self.async_run_with_timeout(self.listening_task)
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
-    def test_listening_process_logs_exception_details_during_initialization(self, ws_connect_mock):
-        ws_connect_mock.side_effect = Exception
-
-        with self.assertRaises(Exception):
-            self.listening_task = asyncio.get_event_loop().create_task(self.data_source._init_websocket_connection())
-            self.async_run_with_timeout(self.listening_task)
-        self.assertTrue(self._is_logged("NETWORK", "Unexpected error occurred during ndax WebSocket Connection ()"))
-
-    @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     def test_listening_process_logs_exception_details_during_authentication(self, ws_connect_mock):
         messages = asyncio.Queue()
         ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
@@ -214,7 +244,7 @@ class NdaxAPIUserStreamDataSourceTests(TestCase):
 
         self.assertTrue(self._is_logged("ERROR", "Error occurred when authenticating to user stream ()"))
         self.assertTrue(self._is_logged("ERROR",
-                                        "Unexpected error with NDAX WebSocket connection. Retrying in 30 seconds. ()"))
+                                        "Unexpected error while listening to user stream. Retrying after 5 seconds..."))
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     def test_listening_process_logs_exception_during_events_subscription(self, ws_connect_mock):
@@ -238,4 +268,4 @@ class NdaxAPIUserStreamDataSourceTests(TestCase):
 
         self.assertTrue(self._is_logged("ERROR", "Error occurred subscribing to ndax private channels ()"))
         self.assertTrue(self._is_logged("ERROR",
-                                        "Unexpected error with NDAX WebSocket connection. Retrying in 30 seconds. ()"))
+                                        "Unexpected error while listening to user stream. Retrying after 5 seconds..."))

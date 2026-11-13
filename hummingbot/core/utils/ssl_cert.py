@@ -1,7 +1,7 @@
 """
 Functions for generating keys and certificates
 """
-from datetime import datetime, timedelta
+import datetime
 from os import listdir
 from os.path import join
 from typing import TYPE_CHECKING
@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+from hummingbot import root_path
 from hummingbot.core.gateway import get_gateway_paths
 
 if TYPE_CHECKING:
@@ -22,13 +23,14 @@ CERT_SUBJECT = [
     x509.NameAttribute(NameOID.COMMON_NAME, 'localhost'),
 ]
 # Set alternative DNS
-SAN_DNS = [x509.DNSName('localhost')]
+SAN_DNS = [x509.DNSName('localhost'), x509.DNSName('gateway')]
 VALIDITY_DURATION = 365
+CONF_DIR_PATH = root_path() / "conf"
 
 
 def generate_private_key(password, filepath):
     """
-    Generate Private Key
+    Generate Private Key using PKCS#8 format for OpenSSL 3 compatibility
     """
 
     private_key = rsa.generate_private_key(
@@ -41,13 +43,13 @@ def generate_private_key(password, filepath):
     if password:
         algorithm = serialization.BestAvailableEncryption(password.encode("utf-8"))
 
-    # Write key to cert
-    # filepath = join(CERT_FILE_PATH, filename)
+    # Write key to cert using PKCS#8 format for OpenSSL 3 compatibility
+    # PKCS#8 is the modern standard and works with both OpenSSL 1.x and 3.x
     with open(filepath, "wb") as key_file:
         key_file.write(
             private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                format=serialization.PrivateFormat.PKCS8,  # Changed from TraditionalOpenSSL
                 encryption_algorithm=algorithm,
             )
         )
@@ -67,10 +69,10 @@ def generate_public_key(private_key, filepath):
     cert_issuer = subject
 
     # Set certification validity duration
-    current_datetime = datetime.utcnow()
-    expiration_datetime = current_datetime + timedelta(days=VALIDITY_DURATION)
+    current_datetime = datetime.datetime.now(datetime.UTC)
+    expiration_datetime = current_datetime + datetime.timedelta(days=VALIDITY_DURATION)
 
-    # Create certification
+    # Create certification with proper X.509 v3 extensions for OpenSSL 3 compatibility
     builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -80,6 +82,26 @@ def generate_public_key(private_key, filepath):
         .not_valid_before(current_datetime)
         .not_valid_after(expiration_datetime)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        # Add Key Usage extension required by OpenSSL 3
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_cert_sign=True,
+                crl_sign=True,
+                key_encipherment=False,
+                content_commitment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False
+            ),
+            critical=True
+        )
+        # Add Subject Key Identifier (required for CA certs)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(private_key.public_key()),
+            critical=False
+        )
     )
 
     # Use private key to sign cert
@@ -127,8 +149,8 @@ def sign_csr(csr, ca_public_key, ca_private_key, filepath):
     Sign CSR with CA public & private keys & generate a verified public key
     """
 
-    current_datetime = datetime.utcnow()
-    expiration_datetime = current_datetime + timedelta(days=VALIDITY_DURATION)
+    current_datetime = datetime.datetime.now(datetime.UTC)
+    expiration_datetime = current_datetime + datetime.timedelta(days=VALIDITY_DURATION)
 
     try:
         builder = (
@@ -139,7 +161,40 @@ def sign_csr(csr, ca_public_key, ca_private_key, filepath):
             .serial_number(x509.random_serial_number())
             .not_valid_before(current_datetime)
             .not_valid_after(expiration_datetime)
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True,)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True,)
+            # Add Key Usage extension for server/client certificates
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    key_encipherment=True,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    content_commitment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    encipher_only=False,
+                    decipher_only=False
+                ),
+                critical=True
+            )
+            # Add Extended Key Usage for TLS Server and Client authentication
+            .add_extension(
+                x509.ExtendedKeyUsage([
+                    x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+                    x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH
+                ]),
+                critical=False
+            )
+            # Add Subject Key Identifier
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(csr.public_key()),
+                critical=False
+            )
+            # Add Authority Key Identifier (links to CA cert)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_public_key.public_key()),
+                critical=False
+            )
         )
 
         for extension in csr.extensions:
@@ -182,21 +237,20 @@ def certs_files_exist(client_config_map: "ClientConfigAdapter") -> bool:
     return all(elem in file_list for elem in required_certs)
 
 
-def create_self_sign_certs(pass_phase: str, client_config_map: "ClientConfigAdapter"):
+def create_self_sign_certs(pass_phase: str, cert_path: str):
     """
     Create self-sign CA Cert
     """
-    cert_directory: str = get_gateway_paths(client_config_map).local_certs_path.as_posix()
 
     filepath_list = {
-        'ca_key': join(cert_directory, ca_key_filename),
-        'ca_cert': join(cert_directory, ca_cert_filename),
-        'server_key': join(cert_directory, server_key_filename),
-        'server_cert': join(cert_directory, server_cert_filename),
-        'server_csr': join(cert_directory, server_csr_filename),
-        'client_key': join(cert_directory, client_key_filename),
-        'client_cert': join(cert_directory, client_cert_filename),
-        'client_csr': join(cert_directory, client_csr_filename)
+        'ca_key': join(cert_path, ca_key_filename),
+        'ca_cert': join(cert_path, ca_cert_filename),
+        'server_key': join(cert_path, server_key_filename),
+        'server_cert': join(cert_path, server_cert_filename),
+        'server_csr': join(cert_path, server_csr_filename),
+        'client_key': join(cert_path, client_key_filename),
+        'client_cert': join(cert_path, client_cert_filename),
+        'client_csr': join(cert_path, client_csr_filename)
     }
 
     # Create CA Private & Public Keys for signing
@@ -212,8 +266,9 @@ def create_self_sign_certs(pass_phase: str, client_config_map: "ClientConfigAdap
         server_csr = x509.load_pem_x509_csr(server_csr_file.read(), default_backend())
 
     # Create Client CSR
-    # local certificate must be unencrypted. Currently, Requests does not support using encrypted keys.
-    client_private_key = generate_private_key(None, filepath_list['client_key'])
+    # Client key is encrypted with the same passphrase as CA and server keys
+    # The aiohttp/ssl library supports encrypted client keys via the password parameter
+    client_private_key = generate_private_key(pass_phase, filepath_list['client_key'])
     # Create CSR
     generate_csr(client_private_key, filepath_list['client_csr'])
     # Load CSR

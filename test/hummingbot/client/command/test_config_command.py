@@ -1,33 +1,25 @@
-import asyncio
-import unittest
-from collections import Awaitable
 from decimal import Decimal
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from test.mock.mock_cli import CLIMockingAssistant
 from typing import Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from pydantic import Field
 
-from hummingbot.client.config.client_config_map import ClientConfigMap
-from hummingbot.client.config.config_data_types import BaseClientModel, ClientFieldData
+from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, read_system_configs_from_yml
 from hummingbot.client.config.config_var import ConfigVar
 from hummingbot.client.config.strategy_config_data_types import BaseStrategyConfigMap
 from hummingbot.client.hummingbot_application import HummingbotApplication
 
 
-class ConfigCommandTest(unittest.TestCase):
+class ConfigCommandTest(IsolatedAsyncioWrapperTestCase):
     @patch("hummingbot.core.utils.trading_pair_fetcher.TradingPairFetcher")
-    def setUp(self, _: MagicMock) -> None:
-        super().setUp()
-        self.ev_loop = asyncio.get_event_loop()
-
-        self.async_run_with_timeout(read_system_configs_from_yml())
-
-        self.client_config = ClientConfigMap()
-        self.config_adapter = ClientConfigAdapter(self.client_config)
-
-        self.app = HummingbotApplication(client_config_map=self.config_adapter)
+    @patch("hummingbot.core.gateway.gateway_http_client.GatewayHttpClient.start_monitor")
+    @patch("hummingbot.client.hummingbot_application.HummingbotApplication.mqtt_start")
+    async def asyncSetUp(self, mock_mqtt_start, mock_gateway_start, mock_trading_pair_fetcher):
+        await read_system_configs_from_yml()
+        self.app = HummingbotApplication()
         self.cli_mock_assistant = CLIMockingAssistant(self.app.app)
         self.cli_mock_assistant.start()
 
@@ -35,17 +27,15 @@ class ConfigCommandTest(unittest.TestCase):
         self.cli_mock_assistant.stop()
         super().tearDown()
 
-    def async_run_with_timeout(self, coroutine: Awaitable, timeout: float = 1):
-        ret = self.ev_loop.run_until_complete(asyncio.wait_for(coroutine, timeout))
-        return ret
-
     @patch("hummingbot.client.hummingbot_application.get_strategy_config_map")
     @patch("hummingbot.client.hummingbot_application.HummingbotApplication.notify")
     def test_list_configs(self, notify_mock, get_strategy_config_map_mock):
         captures = []
+        self.app.client_config_map.instance_id = "TEST_ID"
         notify_mock.side_effect = lambda s: captures.append(s)
         strategy_name = "some-strategy"
-        self.app.strategy_name = strategy_name
+        self.app.trading_core.strategy_name = strategy_name
+        self.app.client_config_map.commands_timeout.other_commands_timeout = Decimal("30.0")
 
         strategy_config_map_mock = {
             "five": ConfigVar(key="five", prompt=""),
@@ -60,28 +50,47 @@ class ConfigCommandTest(unittest.TestCase):
         self.assertEqual(6, len(captures))
         self.assertEqual("\nGlobal Configurations:", captures[0])
 
-        df_str_expected = ("    +--------------------------+----------------------+\n"
-                           "    | Key                      | Value                |\n"
-                           "    |--------------------------+----------------------|\n"
-                           "    | kill_switch_mode         | kill_switch_disabled |\n"
-                           "    | autofill_import          | disabled             |\n"
-                           "    | telegram_mode            | telegram_disabled    |\n"
-                           "    | send_error_logs          | True                 |\n"
-                           "    | pmm_script_mode          | pmm_script_disabled  |\n"
-                           "    | gateway                  |                      |\n"
-                           "    | ∟ gateway_api_host       | localhost            |\n"
-                           "    | ∟ gateway_api_port       | 15888                |\n"
-                           "    | rate_oracle_source       | binance              |\n"
-                           "    | global_token             |                      |\n"
-                           "    | ∟ global_token_name      | USD                  |\n"
-                           "    | ∟ global_token_symbol    | $                    |\n"
-                           "    | rate_limits_share_pct    | 100                  |\n"
-                           "    | commands_timeout         |                      |\n"
-                           "    | ∟ create_command_timeout | 10                   |\n"
-                           "    | ∟ other_commands_timeout | 30                   |\n"
-                           "    | tables_format            | psql                 |\n"
-                           "    | tick_size                | 1.0                  |\n"
-                           "    +--------------------------+----------------------+")
+        df_str_expected = ("    +-----------------------------------+----------------------+\n"
+                           "    | Key                               | Value                |\n"
+                           "    |-----------------------------------+----------------------|\n"
+                           "    | instance_id                       | TEST_ID              |\n"
+                           "    | fetch_pairs_from_all_exchanges    | False                |\n"
+                           "    | kill_switch_mode                  | kill_switch_disabled |\n"
+                           "    | autofill_import                   | disabled             |\n"
+                           "    | mqtt_bridge                       |                      |\n"
+                           "    | ∟ mqtt_host                       | localhost            |\n"
+                           "    | ∟ mqtt_port                       | 1883                 |\n"
+                           "    | ∟ mqtt_username                   |                      |\n"
+                           "    | ∟ mqtt_password                   |                      |\n"
+                           "    | ∟ mqtt_namespace                  | hbot                 |\n"
+                           "    | ∟ mqtt_ssl                        | False                |\n"
+                           "    | ∟ mqtt_logger                     | True                 |\n"
+                           "    | ∟ mqtt_notifier                   | True                 |\n"
+                           "    | ∟ mqtt_commands                   | True                 |\n"
+                           "    | ∟ mqtt_events                     | True                 |\n"
+                           "    | ∟ mqtt_external_events            | True                 |\n"
+                           "    | ∟ mqtt_autostart                  | False                |\n"
+                           "    | send_error_logs                   | True                 |\n"
+                           "    | gateway                           |                      |\n"
+                           "    | ∟ gateway_api_host                | localhost            |\n"
+                           "    | ∟ gateway_api_port                | 15888                |\n"
+                           "    | ∟ gateway_use_ssl                 | False                |\n"
+                           "    | rate_oracle_source                | gate_io              |\n"
+                           "    | global_token                      |                      |\n"
+                           "    | ∟ global_token_name               | USDT                 |\n"
+                           "    | ∟ global_token_symbol             | $                    |\n"
+                           "    | ∟ usd_equivalent_tokens           | ['USD']              |\n"
+                           "    | rate_limits_share_pct             | 100.0                |\n"
+                           "    | commands_timeout                  |                      |\n"
+                           "    | ∟ create_command_timeout          | 10.0                 |\n"
+                           "    | ∟ other_commands_timeout          | 30.0                 |\n"
+                           "    | tables_format                     | psql                 |\n"
+                           "    | tick_size                         | 1.0                  |\n"
+                           "    | market_data_collection            |                      |\n"
+                           "    | ∟ market_data_collection_enabled  | False                |\n"
+                           "    | ∟ market_data_collection_interval | 60                   |\n"
+                           "    | ∟ market_data_collection_depth    | 20                   |\n"
+                           "    +-----------------------------------+----------------------+")
 
         self.assertEqual(df_str_expected, captures[1])
         self.assertEqual("\nColor Settings:", captures[2])
@@ -117,7 +126,7 @@ class ConfigCommandTest(unittest.TestCase):
         captures = []
         notify_mock.side_effect = lambda s: captures.append(s)
         strategy_name = "some-strategy"
-        self.app.strategy_name = strategy_name
+        self.app.trading_core.strategy_name = strategy_name
 
         class DoubleNestedModel(BaseClientModel):
             double_nested_attr: float = Field(default=3.0)
@@ -145,7 +154,7 @@ class ConfigCommandTest(unittest.TestCase):
             class Config:
                 title = "dummy_model"
 
-        get_strategy_config_map_mock.return_value = ClientConfigAdapter(DummyModel.construct())
+        get_strategy_config_map_mock.return_value = ClientConfigAdapter(DummyModel.model_construct())
 
         self.app.list_configs()
 
@@ -173,16 +182,16 @@ class ConfigCommandTest(unittest.TestCase):
     @patch("hummingbot.client.hummingbot_application.HummingbotApplication.notify")
     def test_config_non_configurable_key_fails(self, notify_mock, get_strategy_config_map_mock):
         class DummyModel(BaseStrategyConfigMap):
-            strategy: str = Field(default="pure_market_making", client_data=None)
-            some_attr: int = Field(default=1, client_data=ClientFieldData(prompt=lambda mi: "some prompt"))
+            strategy: str = Field(default="pure_market_making")
+            some_attr: int = Field(default=1, json_schema_extra={"prompt": "some prompt"})
             another_attr: Decimal = Field(default=Decimal("1.0"))
 
             class Config:
                 title = "dummy_model"
 
         strategy_name = "some-strategy"
-        self.app.strategy_name = strategy_name
-        get_strategy_config_map_mock.return_value = ClientConfigAdapter(DummyModel.construct())
+        self.app.trading_core.strategy_name = strategy_name
+        get_strategy_config_map_mock.return_value = ClientConfigAdapter(DummyModel.model_construct())
         self.app.config(key="some_attr")
 
         notify_mock.assert_not_called()
@@ -199,44 +208,42 @@ class ConfigCommandTest(unittest.TestCase):
     @patch("hummingbot.client.command.config_command.save_to_yml")
     @patch("hummingbot.client.hummingbot_application.get_strategy_config_map")
     @patch("hummingbot.client.hummingbot_application.HummingbotApplication.notify")
-    def test_config_single_keys(self, _, get_strategy_config_map_mock, save_to_yml_mock):
+    async def test_config_single_keys(self, _, get_strategy_config_map_mock, save_to_yml_mock):
         class NestedModel(BaseClientModel):
-            nested_attr: str = Field(
-                default="some value", client_data=ClientFieldData(prompt=lambda mi: "some prompt")
-            )
+            nested_attr: str = Field(default="some value", json_schema_extra={"prompt": "some prompt"})
 
             class Config:
                 title = "nested_model"
 
         class DummyModel(BaseStrategyConfigMap):
-            strategy: str = Field(default="pure_market_making", client_data=None)
-            some_attr: int = Field(default=1, client_data=ClientFieldData(prompt=lambda mi: "some prompt"))
+            strategy: str = Field(default="pure_market_making")
+            some_attr: int = Field(default=1, json_schema_extra={"prompt": "some prompt"})
             nested_model: NestedModel = Field(default=NestedModel())
 
             class Config:
                 title = "dummy_model"
 
         strategy_name = "some-strategy"
-        self.app.strategy_name = strategy_name
+        self.app.trading_core.strategy_name = strategy_name
         self.app.strategy_file_name = f"{strategy_name}.yml"
-        config_map = ClientConfigAdapter(DummyModel.construct())
+        config_map = ClientConfigAdapter(DummyModel.model_construct())
         get_strategy_config_map_mock.return_value = config_map
 
-        self.async_run_with_timeout(self.app._config_single_key(key="some_attr", input_value=2))
+        await self.app._config_single_key(key="some_attr", input_value=2)
 
         self.assertEqual(2, config_map.some_attr)
         save_to_yml_mock.assert_called_once()
 
         save_to_yml_mock.reset_mock()
         self.cli_mock_assistant.queue_prompt_reply("3")
-        self.async_run_with_timeout(self.app._config_single_key(key="some_attr", input_value=None))
+        await self.app._config_single_key(key="some_attr", input_value=None)
 
         self.assertEqual(3, config_map.some_attr)
         save_to_yml_mock.assert_called_once()
 
         save_to_yml_mock.reset_mock()
         self.cli_mock_assistant.queue_prompt_reply("another value")
-        self.async_run_with_timeout(self.app._config_single_key(key="nested_model.nested_attr", input_value=None))
+        await self.app._config_single_key(key="nested_model.nested_attr", input_value=None)
 
         self.assertEqual("another value", config_map.nested_model.nested_attr)
         save_to_yml_mock.assert_called_once()

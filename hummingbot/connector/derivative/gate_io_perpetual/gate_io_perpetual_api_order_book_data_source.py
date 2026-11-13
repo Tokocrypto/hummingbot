@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 
 
 class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
+    _DYNAMIC_SUBSCRIBE_ID_START = 100
+    _next_subscribe_id: int = _DYNAMIC_SUBSCRIBE_ID_START
+
     def __init__(
             self,
             trading_pairs: List[str],
@@ -62,8 +65,10 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             {
                 "trading_pair": trading_pair,
                 "update_id": snapshot_response["id"],
-                "bids": [[i['p'], i['s']] for i in snapshot_response["bids"]],
-                "asks": [[i['p'], i['s']] for i in snapshot_response["asks"]],
+                "bids": [[i['p'], self._connector._format_size_to_amount(trading_pair, Decimal(str(i['s'])))] for i in
+                         snapshot_response["bids"]],
+                "asks": [[i['p'], self._connector._format_size_to_amount(trading_pair, Decimal(str(i['s'])))] for i in
+                         snapshot_response["asks"]],
             },
             timestamp=snapshot_timestamp)
         return snapshot_msg
@@ -91,7 +96,7 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         for trade_data in raw_message["result"]:
-            trade_timestamp: int = trade_data["create_time"]
+            trade_timestamp: float = float(trade_data["create_time_ms"]) * 1e-3
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 symbol=trade_data["contract"])
             message_content = {
@@ -102,7 +107,7 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 "trade_id": trade_data["id"],
                 "update_id": trade_timestamp,
                 "price": trade_data["price"],
-                "amount": abs(trade_data["size"]),
+                "amount": abs(self._connector._format_size_to_amount(trading_pair, (Decimal(str(trade_data["size"])))))
             }
             trade_message: Optional[OrderBookMessage] = OrderBookMessage(
                 message_type=OrderBookMessageType.TRADE,
@@ -122,8 +127,10 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             "trading_pair": trading_pair,
             "update_id": update_id,
             "first_update_id": diff_data["U"],
-            "bids": [[i['p'], i['s']] for i in diff_data["b"]],
-            "asks": [[i['p'], i['s']] for i in diff_data["a"]],
+            "bids": [[i['p'], self._connector._format_size_to_amount(trading_pair, Decimal(str(i['s'])))] for i in
+                     diff_data["b"]],
+            "asks": [[i['p'], self._connector._format_size_to_amount(trading_pair, Decimal(str(i['s'])))] for i in
+                     diff_data["a"]],
         }
         diff_message: OrderBookMessage = OrderBookMessage(
             OrderBookMessageType.DIFF,
@@ -218,3 +225,102 @@ class GateIoPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             throttler_limit_id=CONSTANTS.MARK_PRICE_URL,
         )
         return data
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Subscribes to order book and trade channels for a single trading pair
+        on the existing WebSocket connection.
+
+        :param trading_pair: the trading pair to subscribe to
+        :return: True if subscription was successful, False otherwise
+        """
+        if self._ws_assistant is None:
+            self.logger().warning(
+                f"Cannot subscribe to {trading_pair}: WebSocket not connected"
+            )
+            return False
+
+        try:
+            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+            trades_payload = {
+                "time": int(self._time()),
+                "channel": CONSTANTS.TRADES_ENDPOINT_NAME,
+                "event": "subscribe",
+                "payload": [symbol]
+            }
+            subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trades_payload)
+
+            order_book_payload = {
+                "time": int(self._time()),
+                "channel": CONSTANTS.ORDERS_UPDATE_ENDPOINT_NAME,
+                "event": "subscribe",
+                "payload": [symbol, "100ms"]
+            }
+            subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
+
+            await self._ws_assistant.send(subscribe_trade_request)
+            await self._ws_assistant.send(subscribe_orderbook_request)
+
+            self.add_trading_pair(trading_pair)
+            self.logger().info(f"Subscribed to {trading_pair} order book and trade channels")
+            return True
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Error subscribing to {trading_pair}")
+            return False
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Unsubscribes from order book and trade channels for a single trading pair
+        on the existing WebSocket connection.
+
+        :param trading_pair: the trading pair to unsubscribe from
+        :return: True if unsubscription was successful, False otherwise
+        """
+        if self._ws_assistant is None:
+            self.logger().warning(
+                f"Cannot unsubscribe from {trading_pair}: WebSocket not connected"
+            )
+            return False
+
+        try:
+            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+            trades_payload = {
+                "time": int(self._time()),
+                "channel": CONSTANTS.TRADES_ENDPOINT_NAME,
+                "event": "unsubscribe",
+                "payload": [symbol]
+            }
+            unsubscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trades_payload)
+
+            order_book_payload = {
+                "time": int(self._time()),
+                "channel": CONSTANTS.ORDERS_UPDATE_ENDPOINT_NAME,
+                "event": "unsubscribe",
+                "payload": [symbol, "100ms"]
+            }
+            unsubscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
+
+            await self._ws_assistant.send(unsubscribe_trade_request)
+            await self._ws_assistant.send(unsubscribe_orderbook_request)
+
+            self.remove_trading_pair(trading_pair)
+            self.logger().info(f"Unsubscribed from {trading_pair} order book and trade channels")
+            return True
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Error unsubscribing from {trading_pair}")
+            return False
+
+    @classmethod
+    def _get_next_subscribe_id(cls) -> int:
+        """Returns the next subscription ID and increments the counter."""
+        current_id = cls._next_subscribe_id
+        cls._next_subscribe_id += 1
+        return current_id

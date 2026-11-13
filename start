@@ -1,0 +1,84 @@
+#!/bin/bash
+
+PASSWORD=""
+FILENAME=""
+CONFIG=""
+V2_CONF=""
+
+# Parse arguments manually to handle --v2
+ARGS=("$@")
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+    case "${ARGS[$i]}" in
+        -p)
+            i=$((i+1))
+            PASSWORD="${ARGS[$i]}"
+            ;;
+        -f)
+            i=$((i+1))
+            FILENAME="${ARGS[$i]}"
+            ;;
+        -c)
+            i=$((i+1))
+            CONFIG="${ARGS[$i]}"
+            ;;
+        --v2)
+            i=$((i+1))
+            V2_CONF="${ARGS[$i]}"
+            ;;
+        *)
+            echo "Invalid option: ${ARGS[$i]}" >&2
+            exit 1
+            ;;
+    esac
+    i=$((i+1))
+done
+
+# Check if bin/hummingbot_quickstart.py exists
+if [[ ! -f bin/hummingbot_quickstart.py ]]; then
+    echo "Error: bin/hummingbot_quickstart.py command not found. Make sure you are in the Hummingbot root directory"
+    exit 1
+fi
+
+# Check if the hummingbot conda environment is activated
+if [[ $CONDA_DEFAULT_ENV != "hummingbot" ]]; then
+    echo "Error: 'hummingbot' conda environment is not activated. Please activate it and try again."
+    exit 1
+fi
+
+# Build the command to run
+CMD="./bin/hummingbot_quickstart.py"
+if [[ ! -z "$PASSWORD" ]]; then
+    CMD="$CMD -p \"$PASSWORD\""
+fi
+
+# Check for valid file extensions
+if [[ ! -z "$FILENAME" ]]; then
+    if [[ $FILENAME == *.yml || $FILENAME == *.py ]]; then
+        CMD="$CMD -f \"$FILENAME\""
+    else
+        echo "Error: Invalid strategy or script file. File must be a .yml or .py file."
+        exit 4
+    fi
+fi
+
+if [[ ! -z "$CONFIG" ]]; then
+    if [[ $CONFIG == *.yml ]]; then
+        CMD="$CMD -c \"$CONFIG\""
+    else
+        echo "Error: Config file must be a .yml file."
+        exit 3
+    fi
+fi
+
+if [[ ! -z "$V2_CONF" ]]; then
+    if [[ $V2_CONF == *.yml ]]; then
+        CMD="$CMD --v2 \"$V2_CONF\""
+    else
+        echo "Error: V2 config file must be a .yml file."
+        exit 5
+    fi
+fi
+
+# Execute the command
+eval $CMD

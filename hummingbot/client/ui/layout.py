@@ -60,20 +60,19 @@ HEADER = """
 ██   ██ ██    ██ ██  ██  ██ ██  ██  ██ ██ ██  ██ ██ ██    ██ ██   ██ ██    ██    ██
 ██   ██  ██████  ██      ██ ██      ██ ██ ██   ████  ██████  ██████   ██████     ██
 
-=======================================================================================
-Welcome to Hummingbot, an open source software client that helps you build and run
-high-frequency trading (HFT) bots.
+======================================================================================
+Hummingbot is an open source software client that helps you build and run
+market making, arbitrage, and other high-frequency trading bots.
 
-Helpful Links:
-- Get 24/7 support: https://discord.hummingbot.io
-- Learn how to use Hummingbot: https://docs.hummingbot.io
-- Earn liquidity rewards: https://miner.hummingbot.io
+- Official repo: https://github.com/hummingbot/hummingbot
+- Join the community: https://discord.gg/hummingbot
+- Learn market making: https://hummingbot.org/botcamp
 
 Useful Commands:
 - connect     List available exchanges and add API keys to them
-- create      Create a new bot
-- import      Import an existing bot by loading the configuration file
-- help        List available commands
+- balance     See your exchange balances
+- start       Start a script or strategy
+- help        List all commands
 
 """
 
@@ -114,7 +113,7 @@ def create_timer():
         read_only=False,
         scrollbar=False,
         max_line_count=1,
-        width=20,
+        width=30,
     )
 
 
@@ -171,8 +170,8 @@ def create_live_field():
 
 def create_log_toggle(function):
     return Button(
-        text='> log pane',
-        width=13,
+        text='> Ctrl+T',
+        width=10,
         handler=function,
         left_symbol='',
         right_symbol='',
@@ -204,15 +203,26 @@ def get_strategy_file():
     from hummingbot.client.hummingbot_application import HummingbotApplication
     hb = HummingbotApplication.main_application()
     style = "class:log_field"
-    return [(style, f"Strategy File: {hb._strategy_file_name}")]
+    return [(style, f"Strategy File: {hb.strategy_file_name}")]
 
 
 def get_gateway_status():
     from hummingbot.client.hummingbot_application import HummingbotApplication
     hb = HummingbotApplication.main_application()
-    gateway_status = hb._gateway_monitor.gateway_status.name
+    gateway_status = hb.trading_core.gateway_monitor.gateway_status.name
     style = "class:log_field"
-    return [(style, f"Gateway: {gateway_status}")]
+
+    # Check if SSL is enabled
+    use_ssl = getattr(hb.client_config_map.gateway, "gateway_use_ssl", False)
+    lock_icon = "🔒 " if use_ssl else ""
+
+    # Add visual indicator based on status
+    if gateway_status == "ONLINE":
+        status_display = f"🟢 {gateway_status}"
+    else:
+        status_display = f"🔴 {gateway_status}"
+
+    return [(style, f"{lock_icon}Gateway: {status_display}")]
 
 
 def generate_layout(input_field: TextArea,

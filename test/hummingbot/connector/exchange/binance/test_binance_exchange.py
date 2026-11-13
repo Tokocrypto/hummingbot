@@ -8,8 +8,6 @@ from unittest.mock import AsyncMock, patch
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
 
-from hummingbot.client.config.client_config_map import ClientConfigMap
-from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.binance import binance_constants as CONSTANTS, binance_web_utils as web_utils
 from hummingbot.connector.exchange.binance.binance_exchange import BinanceExchange
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
@@ -84,10 +82,10 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                     "isSpotTradingAllowed": True,
                     "isMarginTradingAllowed": True,
                     "filters": [],
-                    "permissions": [
+                    "permissionSets": [[
                         "SPOT",
                         "MARGIN"
-                    ]
+                    ]]
                 },
             ]
         }
@@ -149,9 +147,9 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                     "isSpotTradingAllowed": True,
                     "isMarginTradingAllowed": True,
                     "filters": [],
-                    "permissions": [
+                    "permissionSets": [[
                         "MARGIN"
-                    ]
+                    ]]
                 },
                 {
                     "symbol": self.exchange_symbol_for_tokens("INVALID", "PAIR"),
@@ -176,9 +174,9 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                     "isSpotTradingAllowed": True,
                     "isMarginTradingAllowed": True,
                     "filters": [],
-                    "permissions": [
+                    "permissionSets": [[
                         "MARGIN"
-                    ]
+                    ]]
                 },
             ]
         }
@@ -226,10 +224,10 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                             "minNotional": "0.00100000"
                         }
                     ],
-                    "permissions": [
+                    "permissionSets": [[
                         "SPOT",
                         "MARGIN"
-                    ]
+                    ]]
                 }
             ]
         }
@@ -255,10 +253,10 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                     "ocoAllowed": True,
                     "isSpotTradingAllowed": True,
                     "isMarginTradingAllowed": True,
-                    "permissions": [
+                    "permissionSets": [[
                         "SPOT",
                         "MARGIN"
-                    ]
+                    ]]
                 }
             ]
         }
@@ -297,9 +295,9 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                     "locked": "0.00000000"
                 }
             ],
-            "permissions": [
+            "permissionSets": [[
                 "SPOT"
-            ]
+            ]]
         }
 
     @property
@@ -314,16 +312,8 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             "canDeposit": True,
             "updateTime": 123456789,
             "accountType": "SPOT",
-            "balances": [
-                {
-                    "asset": self.base_asset,
-                    "free": "10.0",
-                    "locked": "5.0"
-                }
-            ],
-            "permissions": [
-                "SPOT"
-            ]
+            "balances": [{"asset": self.base_asset, "free": "10.0", "locked": "5.0"}],
+            "permissionSets": [["SPOT"]],
         }
 
     @property
@@ -332,13 +322,7 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             "e": "outboundAccountPosition",
             "E": 1564034571105,
             "u": 1564034571073,
-            "B": [
-                {
-                    "a": self.base_asset,
-                    "f": "10",
-                    "l": "5"
-                }
-            ]
+            "B": [{"a": self.base_asset, "f": "10", "l": "5"}],
         }
 
     @property
@@ -347,7 +331,7 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     @property
     def expected_supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     @property
     def expected_trading_rule(self):
@@ -370,10 +354,6 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def expected_exchange_order_id(self):
         return 28
-
-    @property
-    def is_cancel_request_executed_synchronously_by_server(self) -> bool:
-        return True
 
     @property
     def is_order_fill_http_update_included_in_status_update(self) -> bool:
@@ -399,15 +379,13 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     @property
     def expected_fill_trade_id(self) -> str:
-        return 30000
+        return str(30000)
 
     def exchange_symbol_for_tokens(self, base_token: str, quote_token: str) -> str:
         return f"{base_token}{quote_token}"
 
     def create_exchange_instance(self):
-        client_config_map = ClientConfigAdapter(ClientConfigMap())
         return BinanceExchange(
-            client_config_map=client_config_map,
             binance_api_key="testAPIKey",
             binance_api_secret="testSecret",
             trading_pairs=[self.trading_pair],
@@ -465,6 +443,15 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         mock_api.delete(regex_url, status=400, callback=callback)
+        return url
+
+    def configure_order_not_found_error_cancelation_response(
+        self, order: InFlightOrder, mock_api: aioresponses, callback: Optional[Callable] = lambda *args, **kwargs: None
+    ) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        response = {"code": -2011, "msg": "Unknown order sent."}
+        mock_api.delete(regex_url, status=400, body=json.dumps(response), callback=callback)
         return url
 
     def configure_one_successful_one_erroneous_cancel_all_response(
@@ -548,6 +535,15 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         response = self._order_status_request_partially_filled_mock_response(order=order)
         mock_api.get(regex_url, body=json.dumps(response), callback=callback)
         return url
+
+    def configure_order_not_found_error_order_status_response(
+        self, order: InFlightOrder, mock_api: aioresponses, callback: Optional[Callable] = lambda *args, **kwargs: None
+    ) -> List[str]:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        response = {"code": -2013, "msg": "Order does not exist."}
+        mock_api.get(regex_url, body=json.dumps(response), status=400, callback=callback)
+        return [url]
 
     def configure_partial_fill_trade_response(
             self,
@@ -681,6 +677,11 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     def trade_event_for_full_fill_websocket_update(self, order: InFlightOrder):
         return None
+
+    def test_throttler_property_exposes_internal_throttler(self):
+        # The public throttler property returns the same instance the connector uses internally,
+        # so other REST consumers (e.g. a candles feed) can share its rate-limit budget.
+        self.assertIs(self.exchange.throttler, self.exchange._throttler)
 
     @aioresponses()
     @patch("hummingbot.connector.time_synchronizer.TimeSynchronizer._current_seconds_counter")
@@ -1098,6 +1099,134 @@ class BinanceExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         exception = IOError("Error executing request POST https://api.binance.com/api/v3/order. HTTP status is 400. "
                             "Error: {'code':-1021,'msg':'Other error.'}")
         self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(exception))
+
+    @aioresponses()
+    def test_place_order_manage_server_overloaded_error_unkown_order(self, mock_api):
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._last_poll_timestamp = (self.exchange.current_timestamp -
+                                              self.exchange.UPDATE_ORDER_STATUS_MIN_INTERVAL - 1)
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mock_response = {"code": -1003, "msg": "Unknown error, please check your request or try again later."}
+        mock_api.post(regex_url, body=json.dumps(mock_response), status=503)
+
+        o_id, transact_time = self.async_run_with_timeout(self.exchange._place_order(
+            order_id="test_order_id",
+            trading_pair=self.trading_pair,
+            amount=Decimal("1"),
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("2"),
+        ))
+        self.assertEqual(o_id, "UNKNOWN")
+
+    @aioresponses()
+    def test_place_order_manage_server_overloaded_error_failure(self, mock_api):
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._last_poll_timestamp = (self.exchange.current_timestamp -
+                                              self.exchange.UPDATE_ORDER_STATUS_MIN_INTERVAL - 1)
+
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mock_response = {"code": -1003, "msg": "Service Unavailable."}
+        mock_api.post(regex_url, body=json.dumps(mock_response), status=503)
+
+        self.assertRaises(
+            IOError,
+            self.async_run_with_timeout,
+            self.exchange._place_order(
+                order_id="test_order_id",
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("2"),
+            ))
+
+        mock_response = {"code": -1003, "msg": "Internal error; unable to process your request. Please try again."}
+        mock_api.post(regex_url, body=json.dumps(mock_response), status=503)
+
+        self.assertRaises(
+            IOError,
+            self.async_run_with_timeout,
+            self.exchange._place_order(
+                order_id="test_order_id",
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("2"),
+            ))
+
+    def test_format_trading_rules__min_notional_present(self):
+        trading_rules = [{
+            "symbol": "COINALPHAHBOT",
+            "baseAssetPrecision": 8,
+            "status": "TRADING",
+            "quotePrecision": 8,
+            "orderTypes": ["LIMIT", "MARKET"],
+            "filters": [
+                {
+                    "filterType": "PRICE_FILTER",
+                    "minPrice": "0.00000100",
+                    "maxPrice": "100000.00000000",
+                    "tickSize": "0.00000100"
+                }, {
+                    "filterType": "LOT_SIZE",
+                    "minQty": "0.00100000",
+                    "maxQty": "100000.00000000",
+                    "stepSize": "0.00100000"
+                }, {
+                    "filterType": "MIN_NOTIONAL",
+                    "minNotional": "0.00100000"
+                }
+            ],
+            "permissionSets": [[
+                "SPOT"
+            ]]
+        }]
+        exchange_info = {"symbols": trading_rules}
+
+        result = self.async_run_with_timeout(self.exchange._format_trading_rules(exchange_info))
+
+        self.assertEqual(result[0].min_notional_size, Decimal("0.00100000"))
+
+    def test_format_trading_rules__notional_but_no_min_notional_present(self):
+        trading_rules = [{
+            "symbol": "COINALPHAHBOT",
+            "baseAssetPrecision": 8,
+            "status": "TRADING",
+            "quotePrecision": 8,
+            "orderTypes": ["LIMIT", "MARKET"],
+            "filters": [
+                {
+                    "filterType": "PRICE_FILTER",
+                    "minPrice": "0.00000100",
+                    "maxPrice": "100000.00000000",
+                    "tickSize": "0.00000100"
+                }, {
+                    "filterType": "LOT_SIZE",
+                    "minQty": "0.00100000",
+                    "maxQty": "100000.00000000",
+                    "stepSize": "0.00100000"
+                }, {
+                    "filterType": "NOTIONAL",
+                    "minNotional": "10.00000000",
+                    "applyMinToMarket": False,
+                    "maxNotional": "10000.00000000",
+                    "applyMaxToMarket": False,
+                    "avgPriceMins": 5
+                }
+            ],
+            "permissionSets": [[
+                "SPOT"
+            ]]
+        }]
+        exchange_info = {"symbols": trading_rules}
+
+        result = self.async_run_with_timeout(self.exchange._format_trading_rules(exchange_info))
+
+        self.assertEqual(result[0].min_notional_size, Decimal("10"))
 
     def _validate_auth_credentials_taking_parameters_from_argument(self,
                                                                    request_call_tuple: RequestCall,

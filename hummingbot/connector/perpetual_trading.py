@@ -70,6 +70,32 @@ class PerpetualTrading:
         """
         self._funding_info[funding_info.trading_pair] = funding_info
 
+    def add_trading_pair(self, trading_pair: str):
+        """
+        Adds a trading pair to the list of tracked trading pairs.
+        This should be called when dynamically adding a trading pair.
+        Note: Funding info should be initialized separately via initialize_funding_info().
+
+        :param trading_pair: the trading pair to add
+        """
+        if trading_pair not in self._trading_pairs:
+            self._trading_pairs.append(trading_pair)
+
+    def remove_trading_pair(self, trading_pair: str):
+        """
+        Removes a trading pair from the list of tracked trading pairs and cleans up related data.
+        This should be called when dynamically removing a trading pair.
+
+        :param trading_pair: the trading pair to remove
+        """
+        if trading_pair in self._trading_pairs:
+            self._trading_pairs.remove(trading_pair)
+        # Clean up funding info
+        self._funding_info.pop(trading_pair, None)
+        # Clean up leverage settings
+        if trading_pair in self._leverage:
+            del self._leverage[trading_pair]
+
     def is_funding_info_initialized(self) -> bool:
         """
         Checks if there is funding information for all trading pairs.
@@ -97,7 +123,7 @@ class PerpetualTrading:
             self._funding_info_updater_task = None
         self._funding_info.clear()
 
-    def position_key(self, trading_pair: str, side: PositionSide = None) -> str:
+    def position_key(self, trading_pair: str, side: PositionSide = None, mode: PositionMode = None) -> str:
         """
         Returns a key to a position in account_positions. On OneWay position mode this is the trading pair.
         On Hedge position mode this is a combination of trading pair and position side
@@ -105,10 +131,12 @@ class PerpetualTrading:
         :param side: The position side (long or short)
         :return: A key to the position in account_positions dictionary
         """
-        if self._position_mode == PositionMode.ONEWAY:
-            return trading_pair
-        elif self._position_mode == PositionMode.HEDGE:
-            return f"{trading_pair}{side.name}"
+        pos_key = ""
+        if mode is not None:
+            pos_key = f"{trading_pair}{side.name}" if mode == PositionMode.HEDGE else trading_pair
+        else:
+            pos_key = f"{trading_pair}{side.name}" if self._position_mode == PositionMode.HEDGE else trading_pair
+        return pos_key
 
     def get_position(self, trading_pair: str, side: PositionSide = None) -> Optional[Position]:
         """
@@ -170,6 +198,13 @@ class PerpetualTrading:
             try:
                 funding_info_message: FundingInfoUpdate = await self._funding_info_stream.get()
                 trading_pair = funding_info_message.trading_pair
+                if trading_pair not in self._funding_info:
+                    # Skip updates for trading pairs that haven't been initialized yet
+                    # This can happen when pairs are added dynamically
+                    self.logger().debug(
+                        f"Received funding info update for uninitialized pair {trading_pair}, skipping."
+                    )
+                    continue
                 funding_info = self._funding_info[trading_pair]
                 funding_info.update(funding_info_message)
             except asyncio.CancelledError:

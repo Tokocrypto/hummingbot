@@ -1,6 +1,6 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -25,18 +25,16 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class KucoinExchange(ExchangePyBase):
     web_utils = web_utils
 
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
                  kucoin_api_key: str,
                  kucoin_passphrase: str,
                  kucoin_secret_key: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
@@ -47,7 +45,7 @@ class KucoinExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_order_fill_ts_s: float = 0
-        super().__init__(client_config_map=client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
     def authenticator(self):
@@ -90,6 +88,14 @@ class KucoinExchange(ExchangePyBase):
         return CONSTANTS.SERVER_TIME_PATH_URL
 
     @property
+    def orders_path_url(self):
+        return CONSTANTS.ORDERS_PATH_URL_HFT if self._domain == "hft" else CONSTANTS.ORDERS_PATH_URL
+
+    @property
+    def fills_path_url(self):
+        return CONSTANTS.FILLS_PATH_URL_HFT if self.domain == "hft" else CONSTANTS.FILLS_PATH_URL
+
+    @property
     def trading_pairs(self):
         return self._trading_pairs
 
@@ -109,8 +115,16 @@ class KucoinExchange(ExchangePyBase):
         return pairs_prices
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
-        # API documentation does not clarify the error message for timestamp related problems
-        return False
+        error_description = str(request_exception)
+        return CONSTANTS.RET_CODE_AUTH_TIMESTAMP_ERROR in error_description and CONSTANTS.RET_MSG_AUTH_TIMESTAMP_ERROR in error_description
+
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        return (str(CONSTANTS.RET_CODE_RESOURCE_NOT_FOUND) in str(status_update_exception) and
+                str(CONSTANTS.RET_MSG_RESOURCE_NOT_FOUND) in str(status_update_exception))
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        return (str(CONSTANTS.RET_CODE_ORDER_NOT_EXIST_OR_NOT_ALLOW_TO_CANCEL) in str(cancelation_exception)
+                and str(CONSTANTS.RET_MSG_ORDER_NOT_EXIST_OR_NOT_ALLOW_TO_CANCEL) in str(cancelation_exception))
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
@@ -179,7 +193,6 @@ class KucoinExchange(ExchangePyBase):
                            order_type: OrderType,
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
-        path_url = CONSTANTS.ORDERS_PATH_URL
         side = trade_type.name.lower()
         order_type_str = "market" if order_type == OrderType.MARKET else "limit"
         data = {
@@ -195,11 +208,13 @@ class KucoinExchange(ExchangePyBase):
             data["price"] = str(price)
             data["postOnly"] = True
         exchange_order_id = await self._api_post(
-            path_url=path_url,
+            path_url=self.orders_path_url,
             data=data,
             is_auth_required=True,
             limit_id=CONSTANTS.POST_ORDER_LIMIT_ID,
         )
+        if exchange_order_id.get("data") is None:
+            raise IOError(f"Error placing order on Kucoin: {exchange_order_id}")
         return str(exchange_order_id["data"]["orderId"]), self.current_timestamp
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
@@ -207,14 +222,18 @@ class KucoinExchange(ExchangePyBase):
         This implementation specific function is called by _cancel, and returns True if successful
         """
         exchange_order_id = await tracked_order.get_exchange_order_id()
+        params = {"symbol": tracked_order.trading_pair} if self.domain == "hft" else None
         cancel_result = await self._api_delete(
-            f"{CONSTANTS.ORDERS_PATH_URL}/{exchange_order_id}",
+            f"{self.orders_path_url}/{exchange_order_id}",
+            params=params,
             is_auth_required=True,
             limit_id=CONSTANTS.DELETE_ORDER_LIMIT_ID
         )
-        if tracked_order.exchange_order_id in cancel_result["data"].get("cancelledOrderIds", []):
-            return True
-        return False
+        response_param = "orderId" if self.domain == "hft" else "cancelledOrderIds"
+        if cancel_result.get("data") is not None:
+            return tracked_order.exchange_order_id in cancel_result["data"].get(response_param, [])
+        else:
+            raise IOError(f"Error cancelling order on Kucoin: {cancel_result}")
 
     async def _user_stream_event_listener(self):
         """
@@ -300,10 +319,11 @@ class KucoinExchange(ExchangePyBase):
     async def _update_balances(self):
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
+        account_type = "trade_hf" if self.domain == "hft" else "trade"
 
         response = await self._api_get(
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
-            params={"type": "trade"},
+            params={"type": account_type},
             is_auth_required=True)
 
         if response:
@@ -341,13 +361,17 @@ class KucoinExchange(ExchangePyBase):
     async def _update_trading_fees(self):
         trading_symbols = [await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                            for trading_pair in self._trading_pairs]
-        params = {"symbols": ",".join(trading_symbols)}
-        resp = await self._api_get(
-            path_url=CONSTANTS.FEE_PATH_URL,
-            params=params,
-            is_auth_required=True,
-        )
-        fees_json = resp["data"]
+        fees_json = []
+        for idx in range(0, len(trading_symbols), CONSTANTS.TRADING_FEES_SYMBOL_LIMIT):
+            sub_trading_symbols = trading_symbols[idx:idx + CONSTANTS.TRADING_FEES_SYMBOL_LIMIT]
+            params = {"symbols": ",".join(sub_trading_symbols)}
+            resp = await self._api_get(
+                path_url=CONSTANTS.FEE_PATH_URL,
+                params=params,
+                is_auth_required=True,
+            )
+            fees_json.extend(resp["data"])
+
         for fee_json in fees_json:
             trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=fee_json["symbol"])
             self._trading_fees[trading_pair] = fee_json
@@ -386,7 +410,7 @@ class KucoinExchange(ExchangePyBase):
             # "If you only specified the start time, the system will automatically
             #  calculate the end time (end time = start time + 7 * 24 hours)"
             all_fills_response = await self._api_get(
-                path_url=CONSTANTS.FILLS_PATH_URL,
+                path_url=self.fills_path_url,
                 params={
                     "pageSize": 500,
                     "startAt": self._last_order_fill_ts_s * 1000,
@@ -428,7 +452,7 @@ class KucoinExchange(ExchangePyBase):
         if order.exchange_order_id is not None:
             exchange_order_id = order.exchange_order_id
             all_fills_response = await self._api_get(
-                path_url=CONSTANTS.FILLS_PATH_URL,
+                path_url=self.fills_path_url,
                 params={
                     "orderId": exchange_order_id,
                     "pageSize": 500,
@@ -459,13 +483,15 @@ class KucoinExchange(ExchangePyBase):
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         exchange_order_id = await tracked_order.get_exchange_order_id()
+        params = {"symbol": tracked_order.trading_pair} if self.domain == "hft" else None
         updated_order_data = await self._api_get(
-            path_url=f"{CONSTANTS.ORDERS_PATH_URL}/{exchange_order_id}",
+            path_url=f"{self.orders_path_url}/{exchange_order_id}",
             is_auth_required=True,
+            params=params,
             limit_id=CONSTANTS.GET_ORDER_LIMIT_ID)
 
         ordered_canceled = updated_order_data["data"]["cancelExist"]
-        is_active = updated_order_data["data"]["isActive"]
+        is_active = updated_order_data["data"]["active"] if self.domain == "hft" else updated_order_data["data"]["isActive"]
         op_type = updated_order_data["data"]["opType"]
 
         new_state = tracked_order.current_state

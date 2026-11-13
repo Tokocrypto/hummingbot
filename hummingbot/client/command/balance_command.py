@@ -8,14 +8,12 @@ import pandas as pd
 from hummingbot.client.config.config_validators import validate_decimal, validate_exchange
 from hummingbot.client.performance import PerformanceMetrics
 from hummingbot.client.settings import AllConnectorSettings
-from hummingbot.connector.other.celo.celo_cli import CeloCLI
-from hummingbot.connector.other.celo.celo_data_types import KEYS as CELO_KEYS
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.user.user_balances import UserBalances
 
 if TYPE_CHECKING:
-    from hummingbot.client.hummingbot_application import HummingbotApplication
+    from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
 
 OPTIONS = [
     "limit",
@@ -90,6 +88,9 @@ class BalanceCommand:
             self.notify("\nA network error prevented the balances to update. See logs for more details.")
             raise
         all_ex_avai_bals = UserBalances.instance().all_available_balances_all_exchanges()
+        # A unified-account venue reports one wallet through several connectors, each in full.
+        # Show every connector, but add each wallet to the total once.
+        duplicate_sources = UserBalances.instance().duplicate_account_sources(all_ex_bals.keys())
 
         exchanges_total = 0
 
@@ -109,21 +110,13 @@ class BalanceCommand:
                 if df[sum_not_for_show_name].sum() != Decimal("0"):
                     allocated_percentage = allocated_total / df[sum_not_for_show_name].sum()
                 self.notify(f"Allocated: {allocated_percentage:.2%}")
-                exchanges_total += df[total_col_name].sum()
+                if exchange in duplicate_sources:
+                    self.notify(f"This is the same exchange account as {duplicate_sources[exchange]}, "
+                                f"so it is not added to the total again.")
+                else:
+                    exchanges_total += df[total_col_name].sum()
 
         self.notify(f"\n\nExchanges Total: {global_token_symbol} {exchanges_total:.0f}    ")
-
-        celo_address = CELO_KEYS.celo_address if hasattr(CELO_KEYS, "celo_address") else None
-        if celo_address is not None:
-            try:
-                if not CeloCLI.unlocked:
-                    await self.validate_n_connect_celo()
-                df = await self.celo_balances_df()
-                lines = ["    " + line for line in df.to_string(index=False).split("\n")]
-                self.notify("\ncelo:")
-                self.notify("\n".join(lines))
-            except Exception as e:
-                self.notify(f"\ncelo CLI Error: {str(e)}")
 
     async def exchange_balances_extra_df(self,  # type: HummingbotApplication
                                          exchange: str,
@@ -162,16 +155,6 @@ class BalanceCommand:
         df = pd.DataFrame(data=rows, columns=["Asset", "Total", total_col_name, "sum_not_for_show", "Allocated"])
         df.sort_values(by=["Asset"], inplace=True)
         return df, allocated_total
-
-    async def celo_balances_df(self,  # type: HummingbotApplication
-                               ):
-        rows = []
-        bals = CeloCLI.balances()
-        for token, bal in bals.items():
-            rows.append({"Asset": token.upper(), "Amount": round(bal.total, 4)})
-        df = pd.DataFrame(data=rows, columns=["Asset", "Amount"])
-        df.sort_values(by=["Asset"], inplace=True)
-        return df
 
     async def asset_limits_df(self,
                               asset_limit_conf: Dict[str, str]):

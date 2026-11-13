@@ -27,7 +27,7 @@ from hummingbot.core.event.events import (
 class AbstractPerpetualDerivativeTests:
     """
     We need to create the abstract TestCase class inside another class not inheriting from TestCase to prevent test
-    frameworks from discovering and tyring to run the abstract class
+    frameworks from discovering and trying to run the abstract class
     """
 
     class PerpetualDerivativeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
@@ -159,12 +159,13 @@ class AbstractPerpetualDerivativeTests:
             self,
             amount: Decimal = Decimal("100"),
             price: Decimal = Decimal("10_000"),
+            order_type: OrderType = OrderType.LIMIT,
             position_action: PositionAction = PositionAction.OPEN,
         ):
             order_id = self.exchange.buy(
                 trading_pair=self.trading_pair,
                 amount=amount,
-                order_type=OrderType.LIMIT,
+                order_type=order_type,
                 price=price,
                 position_action=position_action,
             )
@@ -174,12 +175,13 @@ class AbstractPerpetualDerivativeTests:
             self,
             amount: Decimal = Decimal("100"),
             price: Decimal = Decimal("10_000"),
+            order_type: OrderType = OrderType.LIMIT,
             position_action: PositionAction = PositionAction.OPEN,
         ):
             order_id = self.exchange.sell(
                 trading_pair=self.trading_pair,
                 amount=amount,
-                order_type=OrderType.LIMIT,
+                order_type=order_type,
                 price=price,
                 position_action=position_action,
             )
@@ -196,14 +198,8 @@ class AbstractPerpetualDerivativeTests:
 
             status_dict = self.exchange.status_dict
 
-            expected_initial_dict = {
-                "symbols_mapping_initialized": False,
-                "order_books_initialized": False,
-                "account_balance": False,
-                "trading_rule_initialized": False,
-                "user_stream_initialized": False,
-                "funding_info": False,
-            }
+            expected_initial_dict = self._expected_initial_status_dict()
+            expected_initial_dict["funding_info"] = False
 
             self.assertEqual(expected_initial_dict, status_dict)
             self.assertFalse(self.exchange.ready)
@@ -252,7 +248,8 @@ class AbstractPerpetualDerivativeTests:
                 self.is_logged(
                     "INFO",
                     f"Created {OrderType.LIMIT.name} {TradeType.BUY.name} order {order_id} for "
-                    f"{Decimal('100.000000')} to {PositionAction.OPEN.name} a {self.trading_pair} position."
+                    f"{Decimal('100.000000')} to {PositionAction.OPEN.name} a {self.trading_pair} position "
+                    f"at {Decimal('10000.0000')}."
                 )
             )
 
@@ -296,7 +293,8 @@ class AbstractPerpetualDerivativeTests:
                 self.is_logged(
                     "INFO",
                     f"Created {OrderType.LIMIT.name} {TradeType.SELL.name} order {order_id} for "
-                    f"{Decimal('100.000000')} to {PositionAction.OPEN.name} a {self.trading_pair} position."
+                    f"{Decimal('100.000000')} to {PositionAction.OPEN.name} a {self.trading_pair} position "
+                    f"at {Decimal('10000.0000')}."
                 )
             )
 
@@ -342,7 +340,8 @@ class AbstractPerpetualDerivativeTests:
                 self.is_logged(
                     "INFO",
                     f"Created {OrderType.LIMIT.name} {TradeType.BUY.name} order {order_id} for "
-                    f"{Decimal('100.000000')} to {PositionAction.CLOSE.name} a {self.trading_pair} position."
+                    f"{Decimal('100.000000')} to {PositionAction.CLOSE.name} a {self.trading_pair} position "
+                    f"at {Decimal('10000.0000')}."
                 )
             )
 
@@ -385,7 +384,8 @@ class AbstractPerpetualDerivativeTests:
                 self.is_logged(
                     "INFO",
                     f"Created {OrderType.LIMIT.name} {TradeType.SELL.name} order {order_id} for "
-                    f"{Decimal('100.000000')} to {PositionAction.CLOSE.name} a {self.trading_pair} position."
+                    f"{Decimal('100.000000')} to {PositionAction.CLOSE.name} a {self.trading_pair} position "
+                    f"at {Decimal('10000.0000')}."
                 )
             )
 
@@ -432,15 +432,16 @@ class AbstractPerpetualDerivativeTests:
 
             self.async_run_with_timeout(order.wait_until_completely_filled())
             self.assertTrue(order.is_done)
+
             if self.is_order_fill_http_update_included_in_status_update:
                 self.assertTrue(order.is_filled)
 
-            if self.is_order_fill_http_update_included_in_status_update:
-                trades_request = self._all_executed_requests(mock_api, trade_url)[0]
-                self.validate_auth_credentials_present(trades_request)
-                self.validate_trades_request(
-                    order=order,
-                    request_call=trades_request)
+                if trade_url:
+                    trades_request = self._all_executed_requests(mock_api, trade_url)[0]
+                    self.validate_auth_credentials_present(trades_request)
+                    self.validate_trades_request(
+                        order=order,
+                        request_call=trades_request)
 
                 fill_event: OrderFilledEvent = self.order_filled_logger.event_log[0]
                 self.assertEqual(self.exchange.current_timestamp, fill_event.timestamp)
@@ -585,8 +586,8 @@ class AbstractPerpetualDerivativeTests:
 
             self.assertTrue(
                 self.is_logged(
-                    log_level="NETWORK",
-                    message=f"Error switching {self.trading_pair} mode to {PositionMode.HEDGE}: {error_msg}"
+                    log_level="ERROR",
+                    message=f"Failed to set position mode to {PositionMode.HEDGE}: {error_msg}"
                 )
             )
 
@@ -603,7 +604,7 @@ class AbstractPerpetualDerivativeTests:
 
             self.assertTrue(
                 self.is_logged(
-                    log_level="DEBUG",
+                    log_level="INFO",
                     message=f"Position mode switched to {PositionMode.HEDGE}.",
                 )
             )
@@ -619,7 +620,7 @@ class AbstractPerpetualDerivativeTests:
 
             self.assertTrue(
                 self.is_logged(
-                    log_level="DEBUG",
+                    log_level="INFO",
                     message=f"Position mode switched to {PositionMode.ONEWAY}.",
                 )
             )
@@ -711,28 +712,35 @@ class AbstractPerpetualDerivativeTests:
 
         @aioresponses()
         def test_funding_payment_polling_loop_sends_update_event(self, mock_api):
+            def callback(*args, **kwargs):
+                request_sent_event.set()
+
             self._simulate_trading_rules_initialized()
             request_sent_event = asyncio.Event()
             url = self.funding_payment_url
 
-            self.async_tasks.append(asyncio.get_event_loop().create_task(self.exchange._funding_payment_polling_loop()))
+            async def run_test():
+                response = self.empty_funding_payment_mock_response
+                mock_api.get(url, body=json.dumps(response), callback=callback)
+                _ = asyncio.create_task(self.exchange._funding_payment_polling_loop())
 
-            response = self.empty_funding_payment_mock_response
-            mock_api.get(url, body=json.dumps(response), callback=lambda *args, **kwargs: request_sent_event.set())
-            self.exchange._funding_fee_poll_notifier.set()
-            self.async_run_with_timeout(request_sent_event.wait())
+                # Allow task to start - on first pass no event is emitted (initialization)
+                await asyncio.sleep(0.1)
+                self.assertEqual(0, len(self.funding_payment_logger.event_log))
 
-            request_sent_event.clear()
-            response = self.funding_payment_mock_response
-            mock_api.get(url, body=json.dumps(response), callback=lambda *args, **kwargs: request_sent_event.set())
-            self.exchange._funding_fee_poll_notifier.set()
-            self.async_run_with_timeout(request_sent_event.wait())
+                response = self.funding_payment_mock_response
+                mock_api.get(url, body=json.dumps(response), callback=callback, repeat=True)
 
-            request_sent_event.clear()
-            response = self.funding_payment_mock_response
-            mock_api.get(url, body=json.dumps(response), callback=lambda *args, **kwargs: request_sent_event.set())
-            self.exchange._funding_fee_poll_notifier.set()
-            self.async_run_with_timeout(request_sent_event.wait())
+                request_sent_event.clear()
+                self.exchange._funding_fee_poll_notifier.set()
+                await request_sent_event.wait()
+                self.assertEqual(1, len(self.funding_payment_logger.event_log))
+
+                request_sent_event.clear()
+                self.exchange._funding_fee_poll_notifier.set()
+                await request_sent_event.wait()
+
+            self.async_run_with_timeout(run_test())
 
             self.assertEqual(1, len(self.funding_payment_logger.event_log))
             funding_event: FundingPaymentCompletedEvent = self.funding_payment_logger.event_log[0]

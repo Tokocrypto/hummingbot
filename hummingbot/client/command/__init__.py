@@ -4,13 +4,14 @@ from .connect_command import ConnectCommand
 from .create_command import CreateCommand
 from .exit_command import ExitCommand
 from .export_command import ExportCommand
+from .gateway_approve_command import GatewayApproveCommand
 from .gateway_command import GatewayCommand
 from .help_command import HelpCommand
 from .history_command import HistoryCommand
 from .import_command import ImportCommand
+from .lphistory_command import LPHistoryCommand
+from .mqtt_command import MQTTCommand
 from .order_book_command import OrderBookCommand
-from .pmm_script_command import PMMScriptCommand
-from .previous_strategy_command import PreviousCommand
 from .rate_command import RateCommand
 from .silly_commands import SillyCommands
 from .start_command import StartCommand
@@ -25,17 +26,18 @@ __all__ = [
     CreateCommand,
     ExitCommand,
     ExportCommand,
+    GatewayApproveCommand,
     GatewayCommand,
     HelpCommand,
     HistoryCommand,
     ImportCommand,
+    LPHistoryCommand,
     OrderBookCommand,
-    PMMScriptCommand,
-    PreviousCommand,
     RateCommand,
     SillyCommands,
     StartCommand,
     StatusCommand,
     StopCommand,
     TickerCommand,
+    MQTTCommand,
 ]

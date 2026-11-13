@@ -18,6 +18,7 @@ class RESTAssistant:
     the `RESTPreProcessorBase` and `RESTPostProcessorBase` classes. The pre-processors are applied to a request
     before it is sent out, while the post-processors are applied to a response before it is returned to the caller.
     """
+
     def __init__(
         self,
         connection: RESTConnection,
@@ -33,6 +34,32 @@ class RESTAssistant:
         self._throttler = throttler
 
     async def execute_request(
+        self,
+        url: str,
+        throttler_limit_id: str,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        method: RESTMethod = RESTMethod.GET,
+        is_auth_required: bool = False,
+        return_err: bool = False,
+        timeout: Optional[float] = None,
+        headers: Optional[Dict[str, Any]] = None,
+    ) -> Union[str, Dict[str, Any]]:
+        response = await self.execute_request_and_get_response(
+            url=url,
+            throttler_limit_id=throttler_limit_id,
+            params=params,
+            data=data,
+            method=method,
+            is_auth_required=is_auth_required,
+            return_err=return_err,
+            timeout=timeout,
+            headers=headers,
+        )
+        response_json = await response.json()
+        return response_json
+
+    async def execute_request_and_get_response(
             self,
             url: str,
             throttler_limit_id: str,
@@ -42,13 +69,14 @@ class RESTAssistant:
             is_auth_required: bool = False,
             return_err: bool = False,
             timeout: Optional[float] = None,
-            headers: Optional[Dict[str, Any]] = None) -> Union[str, Dict[str, Any]]:
+            headers: Optional[Dict[str, Any]] = None,
+    ) -> RESTResponse:
 
         headers = headers or {}
 
         local_headers = {
-            "Content-Type": ("application/json" if method in [RESTMethod.POST, RESTMethod.PUT]
-                             else "application/x-www-form-urlencoded")}
+            "Content-Type": ("application/json" if method != RESTMethod.GET else "application/x-www-form-urlencoded")}
+
         local_headers.update(headers)
 
         data = json.dumps(data) if data is not None else data
@@ -67,15 +95,12 @@ class RESTAssistant:
             response = await self.call(request=request, timeout=timeout)
 
             if 400 <= response.status:
-                if return_err:
-                    error_response = await response.json()
-                    return error_response
-                else:
+                if not return_err:
                     error_response = await response.text()
+                    error_text = "N/A" if "<html" in error_response else error_response
                     raise IOError(f"Error executing request {method.name} {url}. HTTP status is {response.status}. "
-                                  f"Error: {error_response}")
-            result = await response.json()
-            return result
+                                  f"Error: {error_text}")
+            return response
 
     async def call(self, request: RESTRequest, timeout: Optional[float] = None) -> RESTResponse:
         request = deepcopy(request)

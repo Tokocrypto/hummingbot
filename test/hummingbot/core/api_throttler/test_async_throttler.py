@@ -61,19 +61,16 @@ class AsyncThrottlerUnitTests(unittest.TestCase):
         self.assertEqual(1, self.throttler._id_to_limit_map[TEST_POOL_ID].limit)
         self.assertEqual(1, self.throttler._id_to_limit_map[TEST_PATH_URL].limit)
 
-    @patch("hummingbot.core.api_throttler.async_throttler_base.AsyncThrottlerBase._client_config_map")
-    def test_init_with_rate_limits_share_pct(self, config_map_mock):
+    def test_init_with_rate_limits_share_pct(self):
 
         rate_share_pct: Decimal = Decimal("55")
-        self.client_config_map.rate_limits_share_pct = rate_share_pct
-        config_map_mock.return_value = self.client_config_map
-        self.throttler = AsyncThrottler(rate_limits=self.rate_limits)
+        self.throttler = AsyncThrottler(rate_limits=self.rate_limits, limits_share_percentage=rate_share_pct)
 
         rate_limits = self.rate_limits.copy()
         rate_limits.append(RateLimit(limit_id="ANOTHER_TEST", limit=10, time_interval=5))
         expected_limit = math.floor(Decimal("10") * rate_share_pct / Decimal("100"))
 
-        throttler = AsyncThrottler(rate_limits=rate_limits)
+        throttler = AsyncThrottler(rate_limits=rate_limits, limits_share_percentage=rate_share_pct)
         self.assertEqual(0.1, throttler._retry_interval)
         self.assertEqual(6, len(throttler._rate_limits))
         self.assertEqual(Decimal("1"), throttler._id_to_limit_map[TEST_POOL_ID].limit)
@@ -83,11 +80,13 @@ class AsyncThrottlerUnitTests(unittest.TestCase):
     def test_get_related_limits(self):
         self.assertEqual(5, len(self.throttler._rate_limits))
 
-        _, related_limits = self.throttler.get_related_limits(TEST_POOL_ID)
-        self.assertEqual(1, len(related_limits))
+        rate_limit, related_limits = self.throttler.get_related_limits(TEST_POOL_ID)
+        self.assertEqual(TEST_POOL_ID, rate_limit.limit_id)
+        self.assertEqual(0, len(related_limits))
 
-        _, related_limits = self.throttler.get_related_limits(TEST_PATH_URL)
-        self.assertEqual(2, len(related_limits))
+        rate_limit, related_limits = self.throttler.get_related_limits(TEST_PATH_URL)
+        self.assertEqual(TEST_PATH_URL, rate_limit.limit_id)
+        self.assertEqual(1, len(related_limits))
 
     def test_flush_empty_task_logs(self):
         # Test: No entries in task_logs to flush
@@ -204,11 +203,13 @@ class AsyncThrottlerUnitTests(unittest.TestCase):
         rate_limit = self.rate_limits[0]
         context = AsyncRequestContext(task_logs=self.throttler._task_logs,
                                       rate_limit=rate_limit,
-                                      related_limits=[(rate_limit, rate_limit.weight)],
+                                      related_limits=[],
                                       lock=asyncio.Lock(),
                                       safety_margin_pct=self.throttler._safety_margin_pct)
         self.ev_loop.run_until_complete(context.acquire())
-        self.assertEqual(2, len(self.throttler._task_logs))
+
+        # We acquire()'d just one rate_limit, task log should have only one entry
+        self.assertEqual(1, len(self.throttler._task_logs))
 
     def test_acquire_awaits_when_exceed_capacity(self):
         rate_limit = self.rate_limits[0]
@@ -223,6 +224,41 @@ class AsyncThrottlerUnitTests(unittest.TestCase):
             self.ev_loop.run_until_complete(
                 asyncio.wait_for(context.acquire(), 1.0)
             )
+
+    def test_concurrent_acquirers_cannot_overbook_a_limit(self):
+        # Many requests queued on the lock at once: the capacity check and the booking of the slot
+        # must happen under one lock hold, or a queued waiter sees capacity already claimed.
+        limit_id = "test_limit"
+        throttler = AsyncThrottler(
+            rate_limits=[RateLimit(limit_id=limit_id, limit=3, time_interval=60)],
+            retry_interval=0.001,
+        )
+        admitted = 0
+        limit_reached = asyncio.Event()
+
+        async def request():
+            nonlocal admitted
+            async with throttler.execute_task(limit_id=limit_id):
+                admitted += 1
+                if admitted >= 3:
+                    limit_reached.set()
+
+        async def scenario():
+            async with throttler._lock:
+                # Queue every request on the lock before any of them can check capacity.
+                tasks = [asyncio.create_task(request()) for _ in range(10)]
+                await asyncio.sleep(0)
+            await asyncio.wait_for(limit_reached.wait(), timeout=5)
+            # Give any over-admitted request, already queued on the lock, the chance to get through.
+            await asyncio.sleep(0.05)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        with patch("hummingbot.logger.logger.HummingbotLogger.notify", lambda *a, **k: None):
+            self.ev_loop.run_until_complete(scenario())
+
+        self.assertEqual(3, admitted)
 
     def test_within_capacity_returns_true_for_throttler_without_configured_limits(self):
         throttler = AsyncThrottler(rate_limits=[])

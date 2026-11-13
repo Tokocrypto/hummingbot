@@ -1,16 +1,10 @@
 import logging
+from typing import Any, Dict, List, Optional
 
-from typing import (
-    Optional,
-    Dict,
-    List, Any)
 import hummingbot.connector.exchange.ndax.ndax_constants as CONSTANTS
 from hummingbot.connector.exchange.ndax.ndax_order_book_message import NdaxOrderBookMessage
 from hummingbot.core.data_type.order_book import OrderBook
-from hummingbot.core.data_type.order_book_message import (
-    OrderBookMessage,
-    OrderBookMessageType,
-)
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.logger import HummingbotLogger
 
 _logger = None

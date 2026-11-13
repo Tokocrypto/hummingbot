@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from collections import OrderedDict, deque
 from typing import TYPE_CHECKING, Dict, List
@@ -6,13 +7,14 @@ from typing import TYPE_CHECKING, Dict, List
 import pandas as pd
 
 from hummingbot import check_dev_mode
+from hummingbot.client.command.gateway_command import GatewayCommand
 from hummingbot.client.config.config_helpers import (
     ClientConfigAdapter,
     get_strategy_config_map,
     missing_required_configs_legacy,
 )
 from hummingbot.client.config.security import Security
-from hummingbot.client.settings import ethereum_wallet_required, required_exchanges
+from hummingbot.client.settings import required_exchanges
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -20,7 +22,7 @@ from hummingbot.logger.application_warning import ApplicationWarning
 from hummingbot.user.user_balances import UserBalances
 
 if TYPE_CHECKING:
-    from hummingbot.client.hummingbot_application import HummingbotApplication
+    from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
 
 
 class StatusCommand:
@@ -66,19 +68,15 @@ class StatusCommand:
         return "\n".join(lines)
 
     async def strategy_status(self, live: bool = False):
-        active_paper_exchanges = [exchange for exchange in self.markets.keys() if exchange.endswith("paper_trade")]
+        active_paper_exchanges = [exchange for exchange in self.trading_core.markets.keys() if exchange.endswith("paper_trade")]
 
         paper_trade = "\n  Paper Trading Active: All orders are simulated, and no real orders are placed." if len(active_paper_exchanges) > 0 \
             else ""
-        app_warning = self.application_warning()
-        app_warning = "" if app_warning is None else app_warning
-        if asyncio.iscoroutinefunction(self.strategy.format_status):
-            st_status = await self.strategy.format_status()
+        if asyncio.iscoroutinefunction(self.trading_core.strategy.format_status):
+            st_status = await self.trading_core.strategy.format_status()
         else:
-            st_status = self.strategy.format_status()
-        status = paper_trade + "\n" + st_status + "\n" + app_warning
-        if self._pmm_script_iterator is not None and live is False:
-            self._pmm_script_iterator.request_status()
+            st_status = self.trading_core.strategy.format_status()
+        status = paper_trade + "\n" + st_status
         return status
 
     def application_warning(self):
@@ -93,18 +91,13 @@ class StatusCommand:
         self  # type: HummingbotApplication
     ) -> Dict[str, str]:
         invalid_conns = {}
-        if self.strategy_name == "celo_arb":
-            err_msg = await self.validate_n_connect_celo(True)
-            if err_msg is not None:
-                invalid_conns["celo"] = err_msg
         if not any([str(exchange).endswith("paper_trade") for exchange in required_exchanges]):
-            connections = await UserBalances.instance().update_exchanges(self.client_config_map, exchanges=required_exchanges)
+            if any([UserBalances.instance().is_gateway_market(exchange) for exchange in required_exchanges]):
+                connections = await GatewayCommand.update_exchange(self, self.client_config_map, exchanges=required_exchanges)
+            else:
+                connections = await UserBalances.instance().update_exchanges(self.client_config_map, exchanges=required_exchanges)
             invalid_conns.update({ex: err_msg for ex, err_msg in connections.items()
                                   if ex in required_exchanges and err_msg is not None})
-            if ethereum_wallet_required():
-                err_msg = UserBalances.validate_ethereum_wallet()
-                if err_msg is not None:
-                    invalid_conns["ethereum"] = err_msg
         return invalid_conns
 
     def missing_configurations_legacy(
@@ -114,34 +107,29 @@ class StatusCommand:
         missing_configs = []
         if not isinstance(config_map, ClientConfigAdapter):
             missing_configs = missing_required_configs_legacy(
-                get_strategy_config_map(self.strategy_name)
+                get_strategy_config_map(self.trading_core.strategy_name)
             )
         return missing_configs
 
-    def validate_configs(
-        self,  # type: HummingbotApplication
-    ) -> List[str]:
-        config_map = self.strategy_config_map
-        validation_errors = config_map.validate_model() if isinstance(config_map, ClientConfigAdapter) else []
-        return validation_errors
-
     def status(self,  # type: HummingbotApplication
                live: bool = False):
+        if threading.current_thread() != threading.main_thread():
+            self.ev_loop.call_soon_threadsafe(self.status, live)
+            return
+
         safe_ensure_future(self.status_check_all(live=live), loop=self.ev_loop)
 
     async def status_check_all(self,  # type: HummingbotApplication
                                notify_success=True,
                                live=False) -> bool:
 
-        if self.strategy is not None:
+        if self.trading_core.strategy is not None:
             if live:
                 await self.stop_live_update()
                 self.app.live_updates = True
-                while self.app.live_updates and self.strategy:
-                    script_status = '\n Status from PMM script would not appear here. ' \
-                                    'Simply run the status command without "--live" to see PMM script status.'
+                while self.app.live_updates and self.trading_core.strategy:
                     await self.cls_display_delay(
-                        await self.strategy_status(live=True) + script_status + "\n\n Press escape key to stop update.", 0.1
+                        await self.strategy_status(live=True) + "\n\n Press escape key to stop update.", 0.1
                     )
                 self.app.live_updates = False
                 self.notify("Stopped live status display update.")
@@ -151,7 +139,7 @@ class StatusCommand:
 
         # Preliminary checks.
         self.notify("\nPreliminary checks:")
-        if self.strategy_name is None or self.strategy_file_name is None:
+        if self.trading_core.strategy_name is None or self.strategy_file_name is None:
             self.notify('  - Strategy check: Please import or create a strategy.')
             return False
 
@@ -166,12 +154,6 @@ class StatusCommand:
                 self.notify(f"    {config.key}")
         elif notify_success:
             self.notify('  - Strategy check: All required parameters confirmed.')
-        validation_errors = self.validate_configs()
-        if len(validation_errors) != 0:
-            self.notify("  - Strategy check: Validation of the config maps failed. The following errors were flagged.")
-            for error in validation_errors:
-                self.notify(f"    {error}")
-            return False
 
         network_timeout = float(self.client_config_map.commands_timeout.other_commands_timeout)
         try:
@@ -186,11 +168,11 @@ class StatusCommand:
         elif notify_success:
             self.notify('  - Exchange check: All connections confirmed.')
 
-        if invalid_conns or missing_configs or len(validation_errors) != 0:
+        if invalid_conns or missing_configs:
             return False
 
         loading_markets: List[ConnectorBase] = []
-        for market in self.markets.values():
+        for market in self.trading_core.markets.values():
             if not market.ready:
                 loading_markets.append(market)
 
@@ -209,17 +191,16 @@ class StatusCommand:
                 )
             return False
 
-        elif not all([market.network_status is NetworkStatus.CONNECTED for market in self.markets.values()]):
+        elif not all([market.network_status is NetworkStatus.CONNECTED for market in self.trading_core.markets.values()]):
             offline_markets: List[str] = [
                 market_name
                 for market_name, market
-                in self.markets.items()
+                in self.trading_core.markets.items()
                 if market.network_status is not NetworkStatus.CONNECTED
             ]
             for offline_market in offline_markets:
                 self.notify(f"  - Connector check: {offline_market} is currently offline.")
             return False
 
-        self.application_warning()
         self.notify("  - All checks: Confirmed.")
         return True

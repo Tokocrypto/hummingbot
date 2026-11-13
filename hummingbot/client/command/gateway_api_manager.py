@@ -73,14 +73,14 @@ class GatewayChainApiManager:
                         continue
                     return node_url
                 except Exception:
-                    self.notify(f"Error occured when trying to ping the node URL: {node_url}.")
+                    self.notify(f"Error occurred when trying to ping the node URL: {node_url}.")
 
     async def _test_node_url_from_gateway_config(self, chain: str, network: str, attempt_connection: bool = True) -> bool:
         """
         Check if gateway node URL for a chain and network works
         """
-        config_dict: Dict[str, Any] = await GatewayHttpClient.get_instance().get_configuration()
-        chain_config: Optional[Dict[str, Any]] = config_dict.get(chain)
+        # XXX: This should be removed once nodeAPIKey is deprecated from Gateway service
+        chain_config: Dict[str, Any] = await GatewayHttpClient.get_instance().get_configuration(chain)
         if chain_config is not None:
             networks: Optional[Dict[str, Any]] = chain_config.get("networks")
             if networks is not None:
@@ -127,4 +127,10 @@ class GatewayChainApiManager:
         """
         Update a chain and network's node URL in gateway
         """
-        await GatewayHttpClient.get_instance().update_config(f"{chain}.networks.{network}.nodeURL", node_url)
+        await GatewayHttpClient.get_instance().update_config(f"{chain}-{network}", "nodeURL", node_url)
+
+    async def _get_native_currency_symbol(self, chain: str, network: str) -> Optional[str]:
+        """
+        Get the native currency symbol for a chain and network from gateway config
+        """
+        return await GatewayHttpClient.get_instance().get_native_currency_symbol(chain, network)

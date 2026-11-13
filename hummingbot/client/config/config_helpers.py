@@ -16,82 +16,26 @@ import ruamel.yaml
 import yaml
 from pydantic import SecretStr, ValidationError
 from pydantic.fields import FieldInfo
-from pydantic.main import ModelMetaclass, validate_model
+from pydantic_core import PydanticUndefinedType
 from yaml import SafeDumper
 
 from hummingbot import get_strategy_list, root_path
-from hummingbot.client.config.client_config_map import ClientConfigMap, CommandShortcutModel
+from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_data_types import BaseClientModel, ClientConfigEnum, ClientFieldData
 from hummingbot.client.config.config_var import ConfigVar
 from hummingbot.client.config.fee_overrides_config_map import fee_overrides_config_map, init_fee_overrides_config
+from hummingbot.client.config.gateway_ssl_config_map import SSLConfigMap
 from hummingbot.client.settings import (
     CLIENT_CONFIG_PATH,
     CONF_DIR_PATH,
     CONF_POSTFIX,
     CONF_PREFIX,
     CONNECTORS_CONF_DIR_PATH,
+    GATEWAY_SSL_CONF_FILE,
     STRATEGIES_CONF_DIR_PATH,
     TEMPLATE_PATH,
     TRADE_FEES_CONFIG_PATH,
     AllConnectorSettings,
-)
-from hummingbot.connector.other.celo import celo_data_types
-
-# Use ruamel.yaml to preserve order and comments in .yml file
-yaml_parser = ruamel.yaml.YAML()  # legacy
-
-
-def decimal_representer(dumper: SafeDumper, data: Decimal):
-    return dumper.represent_float(float(data))
-
-
-def enum_representer(dumper: SafeDumper, data: ClientConfigEnum):
-    return dumper.represent_str(str(data))
-
-
-def date_representer(dumper: SafeDumper, data: date):
-    return dumper.represent_date(data)
-
-
-def time_representer(dumper: SafeDumper, data: time):
-    return dumper.represent_str(data.strftime("%H:%M:%S"))
-
-
-def datetime_representer(dumper: SafeDumper, data: datetime):
-    return dumper.represent_datetime(data)
-
-
-def path_representer(dumper: SafeDumper, data: Path):
-    return dumper.represent_str(str(data))
-
-
-def command_shortcut_representer(dumper: SafeDumper, data: CommandShortcutModel):
-    return dumper.represent_dict(data.__dict__)
-
-
-yaml.add_representer(
-    data_type=Decimal, representer=decimal_representer, Dumper=SafeDumper
-)
-yaml.add_multi_representer(
-    data_type=ClientConfigEnum, multi_representer=enum_representer, Dumper=SafeDumper
-)
-yaml.add_representer(
-    data_type=date, representer=date_representer, Dumper=SafeDumper
-)
-yaml.add_representer(
-    data_type=time, representer=time_representer, Dumper=SafeDumper
-)
-yaml.add_representer(
-    data_type=datetime, representer=datetime_representer, Dumper=SafeDumper
-)
-yaml.add_representer(
-    data_type=Path, representer=path_representer, Dumper=SafeDumper
-)
-yaml.add_representer(
-    data_type=PosixPath, representer=path_representer, Dumper=SafeDumper
-)
-yaml.add_representer(
-    data_type=CommandShortcutModel, representer=command_shortcut_representer, Dumper=SafeDumper
 )
 
 
@@ -146,13 +90,13 @@ class ClientConfigAdapter:
 
     @property
     def title(self) -> str:
-        return self._hb_config.Config.title
+        return self._hb_config.model_config["title"]
 
     def is_required(self, attr: str) -> bool:
         return self._hb_config.is_required(attr)
 
     def keys(self) -> Generator[str, None, None]:
-        return self._hb_config.__fields__.keys()
+        return self._hb_config.__class__.model_fields.keys()
 
     def config_paths(self) -> Generator[str, None, None]:
         return (traversal_item.config_path for traversal_item in self.traverse())
@@ -164,13 +108,12 @@ class ClientConfigAdapter:
         'MISSING_AND_REQUIRED'.
         """
         depth = 0
-        for attr, field in self._hb_config.__fields__.items():
-            field_info = field.field_info
-            type_ = field.type_
+        for attr, field_info in self._hb_config.__class__.model_fields.items():
+            type_ = field_info.annotation
             if hasattr(self, attr):
                 value = getattr(self, attr)
                 printable_value = self._get_printable_value(attr, value, secure)
-                client_field_data = field_info.extra.get("client_data")
+                client_field_data = self.get_client_data(attr)
             else:
                 value = None
                 printable_value = "&cMISSING_AND_REQUIRED"
@@ -199,8 +142,10 @@ class ClientConfigAdapter:
             prompt_fn = client_data.prompt
             if inspect.iscoroutinefunction(prompt_fn):
                 prompt = await prompt_fn(self._hb_config)
-            else:
+            elif inspect.isfunction(prompt_fn):
                 prompt = prompt_fn(self._hb_config)
+            elif isinstance(prompt_fn, str):
+                prompt = prompt_fn
         return prompt
 
     def is_secure(self, attr_name: str) -> bool:
@@ -209,14 +154,22 @@ class ClientConfigAdapter:
         return secure
 
     def get_client_data(self, attr_name: str) -> Optional[ClientFieldData]:
-        return self._hb_config.__fields__[attr_name].field_info.extra.get("client_data")
+        json_schema_extra = self._hb_config.__class__.model_fields[attr_name].json_schema_extra or {}
+        client_data = ClientFieldData(
+            prompt=json_schema_extra.get("prompt"),
+            prompt_on_new=json_schema_extra.get("prompt_on_new", False),
+            is_secure=json_schema_extra.get("is_secure", False),
+            is_connect_key=json_schema_extra.get("is_connect_key", False),
+            is_updatable=json_schema_extra.get("is_updatable", False),
+        )
+        return client_data
 
     def get_description(self, attr_name: str) -> str:
-        return self._hb_config.__fields__[attr_name].field_info.description
+        return self._hb_config.__class__.model_fields[attr_name].description
 
     def get_default(self, attr_name: str) -> Any:
-        default = self._hb_config.__fields__[attr_name].field_info.default
-        if isinstance(default, type(Ellipsis)):
+        default = self._hb_config.__class__.model_fields[attr_name].default
+        if isinstance(default, type(Ellipsis)) or isinstance(default, PydanticUndefinedType):
             default = None
         return default
 
@@ -227,12 +180,14 @@ class ClientConfigAdapter:
             default_str = ""
         elif isinstance(default, (List, Tuple)):
             default_str = ",".join(default)
+        elif isinstance(default, BaseClientModel):
+            default_str = default.model_config["title"]
         else:
             default_str = str(default)
         return default_str
 
     def get_type(self, attr_name: str) -> Type:
-        return self._hb_config.__fields__[attr_name].type_
+        return self._hb_config.__class__.model_fields[attr_name].annotation
 
     def generate_yml_output_str_with_comments(self) -> str:
         fragments_with_comments = [self._generate_title()]
@@ -240,36 +195,46 @@ class ClientConfigAdapter:
         yml_str = "".join(fragments_with_comments)
         return yml_str
 
-    def validate_model(self) -> List[str]:
-        results = validate_model(type(self._hb_config), json.loads(self._hb_config.json()))
-        conf_dict = results[0]
-        self._decrypt_secrets(conf_dict)
-        for key, value in conf_dict.items():
-            self.setattr_no_validation(key, value)
-        errors = results[2]
-        validation_errors = []
-        if errors is not None:
-            errors = errors.errors()
-            validation_errors = [
-                f"{'.'.join(e['loc'])} - {e['msg']}"
-                for e in errors
-            ]
-        return validation_errors
-
     def setattr_no_validation(self, attr: str, value: Any):
         with self._disable_validation():
             setattr(self, attr, value)
 
+    def full_copy(self):
+        return self.__class__(hb_config=self._hb_config.model_copy(deep=True))
+
+    def decrypt_all_secure_data(self):
+        from hummingbot.client.config.security import Security  # avoids circular import
+
+        secure_config_items = (
+            traversal_item
+            for traversal_item in self.traverse()
+            if traversal_item.client_field_data is not None and traversal_item.client_field_data.is_secure
+        )
+        for traversal_item in secure_config_items:
+            value = traversal_item.value
+            if isinstance(value, SecretStr):
+                value = value.get_secret_value()
+            if value == "" or Security.secrets_manager is None:
+                decrypted_value = value
+            else:
+                decrypted_value = Security.secrets_manager.decrypt_secret_value(attr=traversal_item.attr, value=value)
+            *intermediate_items, final_config_element = traversal_item.config_path.split(".")
+            config_model = self
+            if len(intermediate_items) > 0:
+                for attr in intermediate_items:
+                    config_model = config_model.__getattr__(attr)
+            setattr(config_model, final_config_element, decrypted_value)
+
     @contextlib.contextmanager
     def _disable_validation(self):
-        self._hb_config.Config.validate_assignment = False
+        self._hb_config.model_config["validate_assignment"] = False
         yield
-        self._hb_config.Config.validate_assignment = True
+        self._hb_config.model_config["validate_assignment"] = True
 
     def _get_printable_value(self, attr: str, value: Any, secure: bool) -> str:
         if isinstance(value, ClientConfigAdapter):
             if self._is_union(self.get_type(attr)):  # it is a union of modes
-                printable_value = value.hb_config.Config.title
+                printable_value = value.hb_config.model_config["title"]
             else:  # it is a collection of settings stored in a submodule
                 printable_value = ""
         elif isinstance(value, SecretStr) and not secure:
@@ -284,31 +249,49 @@ class ClientConfigAdapter:
         return is_union
 
     def _dict_in_conf_order(self) -> Dict[str, Any]:
-        d = {}
-        for attr in self._hb_config.__fields__.keys():
+        conf_dict = {}
+        for attr in self._hb_config.__class__.model_fields.keys():
             value = getattr(self, attr)
             if isinstance(value, ClientConfigAdapter):
                 value = value._dict_in_conf_order()
-            d[attr] = value
-        return d
+            conf_dict[attr] = value
+        self._encrypt_secrets(conf_dict)
+        return conf_dict
 
     def _encrypt_secrets(self, conf_dict: Dict[str, Any]):
         from hummingbot.client.config.security import Security  # avoids circular import
         for attr, value in conf_dict.items():
-            attr_type = self._hb_config.__fields__[attr].type_
-            if attr_type == SecretStr:
-                conf_dict[attr] = Security.secrets_manager.encrypt_secret_value(attr, value.get_secret_value())
+            if isinstance(value, SecretStr):
+                clear_text_value = value.get_secret_value() if isinstance(value, SecretStr) else value
+                if not Security.secrets_manager:
+                    logging.getLogger().warning(f"Ignore the following error if your config file {attr} contains secret(s)")
+                conf_dict[attr] = Security.secrets_manager.encrypt_secret_value(attr, clear_text_value)
 
     def _decrypt_secrets(self, conf_dict: Dict[str, Any]):
         from hummingbot.client.config.security import Security  # avoids circular import
         for attr, value in conf_dict.items():
-            attr_type = self._hb_config.__fields__[attr].type_
+            attr_type = self._hb_config.model_fields[attr].annotation
             if attr_type == SecretStr:
                 decrypted_value = Security.secrets_manager.decrypt_secret_value(attr, value.get_secret_value())
                 conf_dict[attr] = SecretStr(decrypted_value)
 
+    def _decrypt_all_internal_secrets(self):
+        from hummingbot.client.config.security import Security  # avoids circular import
+
+        for traversal_item in self.traverse():
+            if traversal_item.type_ == SecretStr:
+                encrypted_value = traversal_item.value
+                if isinstance(encrypted_value, SecretStr):
+                    encrypted_value = encrypted_value.get_secret_value()
+                decrypted_value = Security.secrets_manager.decrypt_secret_value(traversal_item.attr, encrypted_value)
+                parent_attributes = traversal_item.config_path.split(".")[:-1]
+                config = self
+                for parent_attribute in parent_attributes:
+                    config = getattr(config, parent_attribute)
+                setattr(config, traversal_item.attr, decrypted_value)
+
     def _generate_title(self) -> str:
-        title = f"{self._hb_config.Config.title}"
+        title = f"{self._hb_config.model_config['title']}"
         title = self._adorn_title(title)
         return title
 
@@ -362,6 +345,72 @@ class ReadOnlyClientConfigAdapter(ClientConfigAdapter):
     @classmethod
     def lock_config(cls, config_map: ClientConfigMap):
         return cls(config_map._hb_config)
+
+
+# Use ruamel.yaml to preserve order and comments in .yml file
+yaml_parser = ruamel.yaml.YAML()  # legacy
+
+
+def decimal_representer(dumper: SafeDumper, data: Decimal):
+    return dumper.represent_float(float(data))
+
+
+def enum_representer(dumper: SafeDumper, data: ClientConfigEnum):
+    return dumper.represent_str(str(data))
+
+
+def date_representer(dumper: SafeDumper, data: date):
+    return dumper.represent_date(data)
+
+
+def time_representer(dumper: SafeDumper, data: time):
+    return dumper.represent_str(data.strftime("%H:%M:%S"))
+
+
+def datetime_representer(dumper: SafeDumper, data: datetime):
+    return dumper.represent_datetime(data)
+
+
+def path_representer(dumper: SafeDumper, data: Path):
+    return dumper.represent_str(str(data))
+
+
+def client_config_adapter_representer(dumper: SafeDumper, data: ClientConfigAdapter):
+    return dumper.represent_dict(data._dict_in_conf_order())
+
+
+def base_client_model_representer(dumper: SafeDumper, data: BaseClientModel):
+    dictionary_representation = ClientConfigAdapter(data)._dict_in_conf_order()
+    return dumper.represent_dict(dictionary_representation)
+
+
+yaml.add_representer(
+    data_type=Decimal, representer=decimal_representer, Dumper=SafeDumper
+)
+yaml.add_multi_representer(
+    data_type=ClientConfigEnum, multi_representer=enum_representer, Dumper=SafeDumper
+)
+yaml.add_representer(
+    data_type=date, representer=date_representer, Dumper=SafeDumper
+)
+yaml.add_representer(
+    data_type=time, representer=time_representer, Dumper=SafeDumper
+)
+yaml.add_representer(
+    data_type=datetime, representer=datetime_representer, Dumper=SafeDumper
+)
+yaml.add_representer(
+    data_type=Path, representer=path_representer, Dumper=SafeDumper
+)
+yaml.add_representer(
+    data_type=PosixPath, representer=path_representer, Dumper=SafeDumper
+)
+yaml.add_representer(
+    data_type=ClientConfigAdapter, representer=client_config_adapter_representer, Dumper=SafeDumper
+)
+yaml.add_multi_representer(
+    data_type=BaseClientModel, multi_representer=base_client_model_representer, Dumper=SafeDumper
+)
 
 
 def parse_cvar_value(cvar: ConfigVar, value: Any) -> Any:
@@ -507,7 +556,7 @@ def get_strategy_config_map(
                                          fromlist=[f"hummingbot.strategy.{strategy}"])
             config_map = getattr(strategy_module, cm_key)
         else:
-            hb_config = config_cls.construct()
+            hb_config = config_cls.model_construct()
             config_map = ClientConfigAdapter(hb_config)
     except Exception:
         config_map = defaultdict()
@@ -558,7 +607,7 @@ def read_yml_file(yml_path: Path) -> Dict[str, Any]:
     return dict(data)
 
 
-def get_strategy_pydantic_config_cls(strategy_name: str) -> Optional[ModelMetaclass]:
+def get_strategy_pydantic_config_cls(strategy_name: str):
     pydantic_cm_class = None
     try:
         pydantic_cm_pkg = f"{strategy_name}_config_map_pydantic"
@@ -582,18 +631,17 @@ async def load_strategy_config_map_from_file(yml_path: Path) -> Union[ClientConf
         await load_yml_into_cm_legacy(str(yml_path), str(template_path), config_map)
     else:
         config_data = read_yml_file(yml_path)
-        hb_config = config_cls.construct()
+        hb_config = config_cls(**config_data)
         config_map = ClientConfigAdapter(hb_config)
-        _load_yml_data_into_map(config_data, config_map)
     return config_map
 
 
 def load_connector_config_map_from_file(yml_path: Path) -> ClientConfigAdapter:
     config_data = read_yml_file(yml_path)
     connector_name = connector_name_from_file(yml_path)
-    hb_config = get_connector_hb_config(connector_name)
+    hb_config = get_connector_hb_config(connector_name).model_validate(config_data)
     config_map = ClientConfigAdapter(hb_config)
-    _load_yml_data_into_map(config_data, config_map)
+    config_map.decrypt_all_secure_data()
     return config_map
 
 
@@ -603,39 +651,38 @@ def load_client_config_map_from_file() -> ClientConfigAdapter:
         config_data = read_yml_file(yml_path)
     else:
         config_data = {}
-    client_config = ClientConfigMap()
+    client_config = ClientConfigMap(**config_data)
     config_map = ClientConfigAdapter(client_config)
-    config_validation_errors = _load_yml_data_into_map(config_data, config_map)
-
-    if len(config_validation_errors) > 0:
-        all_errors = "\n".join(config_validation_errors)
-        raise ConfigValidationError(f"There are errors in the client global configuration (\n{all_errors})")
     save_to_yml(yml_path, config_map)
+    return config_map
+
+
+def load_ssl_config_map_from_file() -> ClientConfigAdapter:
+    yml_path = GATEWAY_SSL_CONF_FILE
+    if yml_path.exists():
+        config_data = read_yml_file(yml_path)
+    else:
+        config_data = {}
+    ssl_config = SSLConfigMap(**config_data)
+    config_map = ClientConfigAdapter(ssl_config)
+
+    if yml_path.exists():
+        save_to_yml(yml_path, config_map)
 
     return config_map
 
 
 def get_connector_hb_config(connector_name: str) -> BaseClientModel:
-    if connector_name == "celo":
-        hb_config = celo_data_types.KEYS
-    else:
-        hb_config = AllConnectorSettings.get_connector_config_keys(connector_name)
+    hb_config = AllConnectorSettings.get_connector_config_keys(connector_name)
     return hb_config
 
 
 def reset_connector_hb_config(connector_name: str):
-    if connector_name == "celo":
-        celo_data_types.KEYS = celo_data_types.KEYS.__class__.construct()
-    else:
-        AllConnectorSettings.reset_connector_config_keys(connector_name)
+    AllConnectorSettings.reset_connector_config_keys(connector_name)
 
 
 def update_connector_hb_config(connector_config: ClientConfigAdapter):
-    connector_name = connector_config.connector
-    if connector_name == "celo":
-        celo_data_types.KEYS = connector_config.hb_config
-    else:
-        AllConnectorSettings.update_connector_config_keys(connector_config.hb_config)
+    AllConnectorSettings.update_connector_config_keys(connector_config.hb_config)
 
 
 def api_keys_from_connector_config_map(cm: ClientConfigAdapter) -> Dict[str, str]:
@@ -658,15 +705,6 @@ def list_connector_configs() -> List[Path]:
         if f.is_file() and not f.name.startswith("_") and not f.name.startswith(".")
     ]
     return connector_configs
-
-
-def _load_yml_data_into_map(yml_data: Dict[str, Any], cm: ClientConfigAdapter) -> List[str]:
-    for key in cm.keys():
-        if key in yml_data:
-            cm.setattr_no_validation(key, yml_data[key])
-
-    config_validation_errors = cm.validate_model()  # try coercing values to appropriate type
-    return config_validation_errors
 
 
 async def load_yml_into_dict(yml_path: str) -> Dict[str, Any]:
@@ -778,7 +816,7 @@ def save_to_yml_legacy(yml_path: str, cm: Dict[str, ConfigVar]):
             data = yaml_parser.load(stream) or {}
             for key in cm:
                 cvar = cm.get(key)
-                if type(cvar.value) == Decimal:
+                if isinstance(cvar.value, Decimal):
                     data[key] = float(cvar.value)
                 else:
                     data[key] = cvar.value
@@ -865,13 +903,11 @@ def short_strategy_name(strategy: str) -> str:
 
 
 def all_configs_complete(strategy_config: Union[ClientConfigAdapter, Dict], client_config_map: ClientConfigAdapter):
-    strategy_valid = (
+    return (
         config_map_complete_legacy(strategy_config)
         if isinstance(strategy_config, Dict)
-        else len(strategy_config.validate_model()) == 0
+        else True
     )
-    client_config_valid = len(client_config_map.validate_model()) == 0
-    return client_config_valid and strategy_valid
 
 
 def config_map_complete_legacy(config_map):
@@ -908,8 +944,3 @@ def parse_config_default_to_text(config: ConfigVar) -> str:
 
 def retrieve_validation_error_msg(e: ValidationError) -> str:
     return e.errors().pop()["msg"]
-
-
-def save_previous_strategy_value(file_name: str, client_config_map: ClientConfigAdapter):
-    client_config_map.previous_strategy = file_name
-    save_to_yml(CLIENT_CONFIG_PATH, client_config_map)

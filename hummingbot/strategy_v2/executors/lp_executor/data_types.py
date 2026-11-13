@@ -1,0 +1,272 @@
+from decimal import Decimal
+from enum import Enum
+from typing import Dict, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from hummingbot.core.data_type.common import TradeType
+from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
+from hummingbot.strategy_v2.executors.validation import (
+    require_lower_than,
+    require_non_empty,
+    require_non_negative,
+    require_not_above,
+    require_positive,
+    require_provider,
+    require_trading_pair,
+)
+from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+
+class LPExecutorStates(Enum):
+    """
+    State machine for LP position lifecycle.
+    Price direction (above/below range) is determined from custom_info, not state.
+    """
+    NOT_ACTIVE = "NOT_ACTIVE"              # No position, no pending orders
+    OPENING = "OPENING"                    # add_liquidity submitted, waiting
+    IN_RANGE = "IN_RANGE"                  # Position active, price within bounds
+    OUT_OF_RANGE = "OUT_OF_RANGE"          # Position active, price outside bounds
+    CLOSING = "CLOSING"                    # remove_liquidity submitted, waiting
+    SWAPPING = "SWAPPING"                  # Close-out swap in progress (keep_position=False)
+    COMPLETE = "COMPLETE"                  # Position closed permanently
+    FAILED = "FAILED"                      # Max retries reached, manual intervention required
+
+
+class LPExecutorConfig(ExecutorConfigBase):
+    """
+    Configuration for LP Position Executor.
+
+    - Creates position based on config bounds and amounts
+    - Monitors position state (IN_RANGE, OUT_OF_RANGE)
+    - Closes when price exceeds upper_limit_price or lower_limit_price
+    - Always closes the position on-chain when the executor stops; keep_position
+      only decides whether the round trip's net change is kept and recorded as a
+      spot position, or swapped back so the executor ends position-neutral
+
+    Provider Architecture:
+    - connector_name: The network identifier (e.g., "solana-mainnet-beta")
+      This is the "connector" that hummingbot connects to.
+    - lp_provider: LP provider in format "dex/trading_type" (e.g., "meteora/clmm")
+      Used for pool info, add liquidity, remove liquidity operations.
+    - swap_provider: Optional swap provider for close-out swaps when keep_position=False.
+      If not provided, uses the network's default swap provider.
+    """
+    type: Literal["lp_executor"] = "lp_executor"
+
+    # Network connector - e.g., "solana-mainnet-beta"
+    connector_name: str
+
+    # LP provider (required) - format: "dex/trading_type"
+    # Examples: "meteora/clmm", "orca/clmm", "raydium/clmm"
+    # Used for pool operations: get_pool_info, add_liquidity, remove_liquidity
+    lp_provider: str
+
+    # Swap provider (optional) - format: "dex/trading_type"
+    # Examples: "jupiter/router", "orca/router"
+    # Used for close-out swaps when keep_position=False to return to original quote asset.
+    # If None, uses the network's default swap provider.
+    swap_provider: Optional[str] = None
+
+    # Pool identification (required)
+    pool_address: str
+
+    # Trading pair for the pool (required) - e.g., "SOL-USDC"
+    trading_pair: str
+
+    # Position price bounds
+    lower_price: Decimal
+    upper_price: Decimal
+
+    # Position amounts
+    base_amount: Decimal = Decimal("0")
+    quote_amount: Decimal = Decimal("0")
+
+    # Minimum time between on-chain position reads. The executor control loop can
+    # continue running frequently for lifecycle actions without making one Gateway
+    # request per tick for every active LP position.
+    position_refresh_interval: float = 1.0
+
+    # Position side: TradeType.BUY (quote only), TradeType.SELL (base only), TradeType.RANGE (50/50)
+    side: TradeType
+
+    # Limit prices: close position when price exceeds these limits
+    # Works like grid executor - closes when price goes beyond the limit
+    # upper_limit_price: close when price >= this value (None = no upper limit)
+    # lower_limit_price: close when price <= this value (None = no lower limit)
+    upper_limit_price: Optional[Decimal] = None
+    lower_limit_price: Optional[Decimal] = None
+
+    # Slippage, and how far the executor may widen it across retries.
+    #
+    # Before this existed there was no slippage setting at any executor level: the
+    # request omitted slippagePct entirely, so every attempt used the connector's
+    # configured value (1-2% depending on the venue) and every retry repeated the same
+    # request. A close that failed on slippage failed ten times identically, paying gas
+    # on any attempt that reached the chain.
+    #
+    # The ramp starts deliberately tight — 0.05% asks for near-spot execution — and
+    # widens by `slippage_multiplier` on each failure Gateway attributes to slippage,
+    # never past `max_slippage_pct`: 0.05, 0.25, 1.25, 5. A failure of any other kind
+    # does not widen it, or a wrong tick or an insufficient balance would loosen an
+    # order that was never too tight.
+    #
+    # It applies to entries as well as exits. An entry filled 5% worse than quoted is a
+    # worse trade than the strategy asked for, so the tight start matters there too;
+    # the difference is what happens at the ceiling, where an exit keeps trying (the
+    # position must come out) and an entry stops (nothing is stranded).
+    slippage_pct: Decimal = Decimal("0.05")
+    slippage_multiplier: Decimal = Decimal("5")
+    max_slippage_pct: Decimal = Decimal("5")
+
+    # Connector-specific params
+    extra_params: Optional[Dict] = None  # e.g., {"strategyType": 0} for Meteora
+
+    # What to do when the executor closes *itself* (a limit price is hit).
+    # A caller-initiated stop passes its own keep_position to early_stop(), which
+    # overrides this. True: keep the round trip's net token change and record it
+    # as a spot position. False: swap that net back, ending position-neutral.
+    # Defaults False to match GridExecutorConfig and hummingbot-api's /stop.
+    keep_position: bool = False
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def validate_lp_position(self):
+        require_non_empty("connector_name", self.connector_name)
+        # Both providers have to carry their trading type: Gateway rejects a bare name
+        # with a 400, and for swap_provider that used to surface only on the close-out
+        # swap, i.e. while the position's funds are exposed.
+        require_provider("lp_provider", self.lp_provider)
+        require_provider("swap_provider", self.swap_provider, required=False)
+        require_non_empty("pool_address", self.pool_address)
+        require_trading_pair("trading_pair", self.trading_pair)
+        require_positive("lower_price", self.lower_price)
+        require_lower_than("lower_price", self.lower_price, "upper_price", self.upper_price)
+        # The limit prices close the position once the price leaves the range, so a limit inside
+        # the range would close the position while it is still earning fees.
+        require_positive("upper_limit_price", self.upper_limit_price)
+        require_positive("lower_limit_price", self.lower_limit_price)
+        require_not_above("upper_price", self.upper_price, "upper_limit_price", self.upper_limit_price)
+        require_not_above("lower_limit_price", self.lower_limit_price, "lower_price", self.lower_price)
+        require_non_negative("base_amount", self.base_amount)
+        require_non_negative("quote_amount", self.quote_amount)
+        require_positive("position_refresh_interval", self.position_refresh_interval)
+        if self.base_amount == 0 and self.quote_amount == 0:
+            raise ValueError("base_amount and quote_amount cannot both be 0: "
+                             "at least one side of the position has to be funded")
+        require_positive("slippage_pct", self.slippage_pct)
+        require_positive("max_slippage_pct", self.max_slippage_pct)
+        require_not_above("slippage_pct", self.slippage_pct, "max_slippage_pct", self.max_slippage_pct)
+        # A multiplier of 1 or less never widens, which makes max_slippage_pct a promise
+        # the ramp cannot keep: the retries would all repeat the starting value.
+        if self.slippage_multiplier <= 1:
+            raise ValueError(f"slippage_multiplier must be greater than 1, got {self.slippage_multiplier}")
+        return self
+
+
+class LPExecutorState(BaseModel):
+    """Tracks a single LP position state within executor."""
+    position_address: Optional[str] = None
+    lower_price: Decimal = Decimal("0")
+    upper_price: Decimal = Decimal("0")
+    base_amount: Decimal = Decimal("0")
+    quote_amount: Decimal = Decimal("0")
+    base_fee: Decimal = Decimal("0")
+    quote_fee: Decimal = Decimal("0")
+
+    # Actual amounts deposited at ADD time (for accurate P&L calculation)
+    # Note: base_amount/quote_amount above change as price moves; these are fixed
+    initial_base_amount: Decimal = Decimal("0")
+    initial_quote_amount: Decimal = Decimal("0")
+
+    # Market price at ADD time for accurate P&L calculation
+    add_mid_price: Decimal = Decimal("0")
+
+    # Rent and fee tracking
+    position_rent: Decimal = Decimal("0")  # SOL rent paid to create position (ADD only)
+    position_rent_refunded: Decimal = Decimal("0")  # SOL rent refunded on close (REMOVE only)
+    tx_fee: Decimal = Decimal("0")  # Transaction fee paid (both ADD and REMOVE)
+
+    # Transaction hashes for tracking
+    open_tx_hash: Optional[str] = None  # Transaction hash for ADD
+    close_tx_hash: Optional[str] = None  # Transaction hash for REMOVE
+
+    # A transaction whose confirmation had to be reconciled by polling its signature comes
+    # back without Gateway's response `data`, so the figures only that block carries are
+    # unavailable. These flags mark the resulting hole in the accounting: position address
+    # and deposited amounts / rent on the open, collected fees, removed amounts and rent
+    # refund on the close.
+    open_data_unavailable: bool = False
+    close_data_unavailable: bool = False
+
+    # Order tracking
+    active_open_order: Optional[TrackedOrder] = None
+    active_close_order: Optional[TrackedOrder] = None
+    active_swap_order: Optional[TrackedOrder] = None  # Close-out swap order
+
+    # State
+    state: LPExecutorStates = LPExecutorStates.NOT_ACTIVE
+
+    # Timestamp when position went out of range (for calculating duration)
+    _out_of_range_since: Optional[float] = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def get_out_of_range_seconds(self, current_time: float) -> Optional[int]:
+        """Returns seconds the position has been out of range, or None if in range."""
+        if self._out_of_range_since is None:
+            return None
+        return int(current_time - self._out_of_range_since)
+
+    def update_state(self, current_price: Optional[Decimal] = None, current_time: Optional[float] = None):
+        """
+        Update state based on position_address and price.
+        Called each control_task cycle.
+
+        Note: We don't use TrackedOrder.is_filled since it's read-only.
+        Instead, we check:
+        - position_address set = position was created
+        - state == COMPLETE (set by event handler) = position was closed
+
+        Args:
+            current_price: Current market price
+            current_time: Current timestamp (for tracking _out_of_range_since)
+        """
+        # If already complete, closing, swapping, failed, or opening (waiting for retry), preserve state
+        # These states are managed explicitly by the executor, don't overwrite them
+        if self.state in (LPExecutorStates.COMPLETE, LPExecutorStates.CLOSING, LPExecutorStates.SWAPPING, LPExecutorStates.FAILED):
+            return
+
+        # Preserve OPENING state when no position exists (handles max_retries case)
+        # State only transitions from OPENING when position_address is set
+        if self.state == LPExecutorStates.OPENING and self.position_address is None:
+            return
+
+        # If closing order is active, we're closing
+        if self.active_close_order is not None:
+            self.state = LPExecutorStates.CLOSING
+            return
+
+        # If open order is active but position not yet created, we're opening
+        if self.active_open_order is not None and self.position_address is None:
+            self.state = LPExecutorStates.OPENING
+            return
+
+        # Position exists - determine state based on price location
+        if self.position_address and current_price is not None:
+            if current_price < self.lower_price or current_price > self.upper_price:
+                self.state = LPExecutorStates.OUT_OF_RANGE
+            else:
+                self.state = LPExecutorStates.IN_RANGE
+        elif self.position_address is None:
+            self.state = LPExecutorStates.NOT_ACTIVE
+
+        # Track _out_of_range_since timer (matches original script logic)
+        if self.state == LPExecutorStates.IN_RANGE:
+            # Price back in range - reset timer
+            self._out_of_range_since = None
+        elif self.state == LPExecutorStates.OUT_OF_RANGE:
+            # Price out of bounds - start timer if not already started
+            if self._out_of_range_since is None and current_time is not None:
+                self._out_of_range_since = current_time

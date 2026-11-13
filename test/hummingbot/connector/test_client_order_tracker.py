@@ -4,8 +4,6 @@ from decimal import Decimal
 from typing import Awaitable, Dict
 from unittest.mock import patch
 
-from hummingbot.client.config.client_config_map import ClientConfigMap
-from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.client_order_tracker import ClientOrderTracker
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -37,7 +35,8 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.ev_loop = asyncio.get_event_loop()
+        cls.ev_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(cls.ev_loop)
 
         cls.base_asset = "COINALPHA"
         cls.quote_asset = "HBOT"
@@ -48,7 +47,7 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
         super().setUp()
         self.log_records = []
 
-        self.connector = MockExchange(client_config_map=ClientConfigAdapter(ClientConfigMap()))
+        self.connector = MockExchange()
         self.connector._set_current_timestamp(1640000000.0)
         self.tracker = ClientOrderTracker(connector=self.connector)
 
@@ -343,7 +342,7 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
             self._is_logged(
                 "INFO",
                 f"Created {order.order_type.name} {order.trade_type.name} order {order.client_order_id} for "
-                f"{order.amount} {order.trading_pair}.",
+                f"{order.amount} {order.trading_pair} at {order.price}.",
             )
         )
 
@@ -394,7 +393,7 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
             self._is_logged(
                 "INFO",
                 f"Created {order.order_type.name} {order.trade_type.name} order {order.client_order_id} for "
-                f"{order.amount} {order.trading_pair}.",
+                f"{order.amount} {order.trading_pair} at {order.price}.",
             )
         )
 
@@ -408,6 +407,47 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
         self.assertEqual(event_logged.price, order.price)
         self.assertEqual(event_logged.trading_pair, order.trading_pair)
         self.assertEqual(event_logged.type, order.order_type)
+
+    def test_process_order_update_with_pending_status_does_not_trigger_order_creation_event(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id="someClientOrderId",
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+        )
+        self.tracker.start_tracking_order(order)
+
+        order_creation_update: OrderUpdate = OrderUpdate(
+            client_order_id=order.client_order_id,
+            exchange_order_id="someExchangeOrderId",
+            trading_pair=self.trading_pair,
+            update_timestamp=1,
+            new_state=order.current_state,
+        )
+
+        update_future = self.tracker.process_order_update(order_creation_update)
+        self.async_run_with_timeout(update_future)
+
+        updated_order: InFlightOrder = self.tracker.fetch_tracked_order(order.client_order_id)
+
+        # Check order update has been successfully applied
+        self.assertEqual(updated_order.exchange_order_id, order_creation_update.exchange_order_id)
+        self.assertTrue(updated_order.exchange_order_id_update_event.is_set())
+        self.assertTrue(updated_order.is_pending_create)
+
+        self.assertFalse(
+            self._is_logged(
+                "INFO",
+                f"Created {order.order_type.name} {order.trade_type.name} order {order.client_order_id} for "
+                f"{order.amount} {order.trading_pair}.",
+            )
+        )
+
+        # Check that Buy/SellOrderCreatedEvent has not been triggered.
+        self.assertEqual(0, len(self.buy_order_created_logger.event_log))
 
     def test_process_order_update_trigger_order_cancelled_event(self):
         order: InFlightOrder = InFlightOrder(
@@ -597,7 +637,7 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
             self._is_logged(
                 "INFO",
                 f"The {order.trade_type.name.upper()} order {order.client_order_id} amounting to "
-                f"{trade_filled_amount}/{order.amount} {order.base_asset} has been filled.",
+                f"{trade_filled_amount}/{order.amount} {order.base_asset} has been filled at {trade_filled_price} {order.quote_asset}.",
             )
         )
 
@@ -649,7 +689,7 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
             self._is_logged(
                 "INFO",
                 f"The {order.trade_type.name.upper()} order {order.client_order_id} amounting to "
-                f"{order.amount}/{order.amount} {order.base_asset} has been filled.",
+                f"{order.amount}/{order.amount} {order.base_asset} has been filled at {order.price} {order.quote_asset}.",
             )
         )
 
@@ -1082,3 +1122,12 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
 
         self.assertTrue(order.is_failure)
         self.assertIn(order.client_order_id, self.tracker.lost_orders)
+
+    def test_setting_lost_order_count_limit(self):
+        self.tracker.lost_order_count_limit = 1
+
+        self.assertEqual(1, self.tracker.lost_order_count_limit)
+
+        self.tracker.lost_order_count_limit = 2
+
+        self.assertEqual(2, self.tracker.lost_order_count_limit)

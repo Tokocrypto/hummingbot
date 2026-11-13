@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import os.path
 import threading
 import time
@@ -10,8 +12,10 @@ import pandas as pd
 from sqlalchemy.orm import Query, Session
 
 from hummingbot import data_path
+from hummingbot.client.config.client_config_map import MarketDataCollectionConfigMap
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.utils import TradeFillOrderDetails
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -23,34 +27,53 @@ from hummingbot.core.event.events import (
     OrderExpiredEvent,
     OrderFilledEvent,
     PositionAction,
-    RangePositionClosedEvent,
-    RangePositionFeeCollectedEvent,
     RangePositionLiquidityAddedEvent,
     RangePositionLiquidityRemovedEvent,
     SellOrderCompletedEvent,
     SellOrderCreatedEvent,
 )
+from hummingbot.logger import HummingbotLogger
+from hummingbot.model.controllers import Controllers
+from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
+from hummingbot.model.market_data import MarketData
 from hummingbot.model.market_state import MarketState
 from hummingbot.model.order import Order
 from hummingbot.model.order_status import OrderStatus
-from hummingbot.model.range_position_collected_fees import RangePositionCollectedFees
+from hummingbot.model.position import Position
 from hummingbot.model.range_position_update import RangePositionUpdate
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
+from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
 class MarketsRecorder:
+    _logger = None
+    _shared_instance: "MarketsRecorder" = None
     market_event_tag_map: Dict[int, MarketEvent] = {
         event_obj.value: event_obj
         for event_obj in MarketEvent.__members__.values()
     }
 
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs) -> "MarketsRecorder":
+        if cls._shared_instance is None:
+            cls._shared_instance = MarketsRecorder(*args, **kwargs)
+        return cls._shared_instance
+
     def __init__(self,
                  sql: SQLConnectionManager,
                  markets: List[ConnectorBase],
                  config_file_path: str,
-                 strategy_name: str):
+                 strategy_name: str,
+                 market_data_collection: MarketDataCollectionConfigMap):
         if threading.current_thread() != threading.main_thread():
             raise EnvironmentError("MarketsRecorded can only be initialized from the main thread.")
 
@@ -59,6 +82,8 @@ class MarketsRecorder:
         self._markets: List[ConnectorBase] = markets
         self._config_file_path: str = config_file_path
         self._strategy_name: str = strategy_name
+        self._market_data_collection_config: MarketDataCollectionConfigMap = market_data_collection
+        self._market_data_collection_task: Optional[asyncio.Task] = None
         # Internal collection of trade fills in connector will be used for remote/local history reconciliation
         for market in self._markets:
             trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
@@ -75,12 +100,8 @@ class MarketsRecorder:
         self._fail_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_fail_order)
         self._complete_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_complete_order)
         self._expire_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_expire_order)
-        self._funding_payment_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(
-            self._did_complete_funding_payment)
-        self._update_range_position_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(
-            self._did_update_range_position)
-        self._close_range_position_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(
-            self._did_close_position)
+        self._funding_payment_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_complete_funding_payment)
+        self._update_range_position_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_update_range_position)
 
         self._event_pairs: List[Tuple[MarketEvent, SourceInfoEventForwarder]] = [
             (MarketEvent.BuyOrderCreated, self._create_order_forwarder),
@@ -94,9 +115,44 @@ class MarketsRecorder:
             (MarketEvent.FundingPaymentCompleted, self._funding_payment_forwarder),
             (MarketEvent.RangePositionLiquidityAdded, self._update_range_position_forwarder),
             (MarketEvent.RangePositionLiquidityRemoved, self._update_range_position_forwarder),
-            (MarketEvent.RangePositionFeeCollected, self._update_range_position_forwarder),
-            (MarketEvent.RangePositionClosed, self._close_range_position_forwarder),
         ]
+        MarketsRecorder._shared_instance = self
+
+    def _start_market_data_recording(self):
+        self._market_data_collection_task = self._ev_loop.create_task(self._record_market_data())
+
+    async def _record_market_data(self):
+        while True:
+            try:
+                if all(ex.ready for ex in self._markets):
+                    with self._sql_manager.get_new_session() as session:
+                        with session.begin():
+                            for market in self._markets:
+                                exchange = market.display_name
+                                for trading_pair in market.trading_pairs:
+                                    mid_price = market.get_price_by_type(trading_pair, PriceType.MidPrice)
+                                    best_bid = market.get_price_by_type(trading_pair, PriceType.BestBid)
+                                    best_ask = market.get_price_by_type(trading_pair, PriceType.BestAsk)
+                                    order_book = market.get_order_book(trading_pair)
+                                    depth = self._market_data_collection_config.market_data_collection_depth + 1
+                                    market_data = MarketData(
+                                        timestamp=self.db_timestamp,
+                                        exchange=exchange,
+                                        trading_pair=trading_pair,
+                                        mid_price=mid_price,
+                                        best_bid=best_bid,
+                                        best_ask=best_ask,
+                                        order_book={
+                                            "bid": list(order_book.bid_entries())[:depth],
+                                            "ask": list(order_book.ask_entries())[:depth]}
+                                    )
+                                    session.add(market_data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error("Unexpected error while recording market data.", e)
+            finally:
+                await self._sleep(self._market_data_collection_config.market_data_collection_interval)
 
     @property
     def sql_manager(self) -> SQLConnectionManager:
@@ -118,11 +174,130 @@ class MarketsRecorder:
         for market in self._markets:
             for event_pair in self._event_pairs:
                 market.add_listener(event_pair[0], event_pair[1])
+        if self._market_data_collection_config.market_data_collection_enabled:
+            self._start_market_data_recording()
+
+    def add_market(self, market: ConnectorBase):
+        """Add a new market/connector dynamically."""
+        if market not in self._markets:
+            self._markets.append(market)
+
+            # Add trade fills from recorder
+            trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
+            market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(tf.market,
+                                                                               tf.exchange_trade_id,
+                                                                               tf.symbol) for tf in trade_fills
+                                                         if tf.market == market.name})
+
+            # Add exchange order IDs
+            exchange_order_ids = self.get_orders_for_config_and_market(self._config_file_path, market, True, 2000)
+            market.add_exchange_order_ids_from_market_recorder({o.exchange_order_id: o.id for o in exchange_order_ids})
+
+            # Add event listeners
+            for event_pair in self._event_pairs:
+                market.add_listener(event_pair[0], event_pair[1])
+
+    def remove_market(self, market: ConnectorBase):
+        """Remove a market/connector dynamically."""
+        if market in self._markets:
+            # Remove event listeners
+            for event_pair in self._event_pairs:
+                market.remove_listener(event_pair[0], event_pair[1])
+
+            # Remove from markets list
+            self._markets.remove(market)
 
     def stop(self):
         for market in self._markets:
             for event_pair in self._event_pairs:
                 market.remove_listener(event_pair[0], event_pair[1])
+        if self._market_data_collection_task is not None:
+            self._market_data_collection_task.cancel()
+
+    def store_or_update_executor(self, executor):
+        with self._sql_manager.get_new_session() as session:
+            existing_executor = session.query(Executors).filter(Executors.id == executor.config.id).one_or_none()
+            serialized_config = executor.executor_info.model_dump_json()
+            executor_dict = json.loads(serialized_config)
+            if existing_executor:
+                # Update existing executor
+                for attr, value in executor_dict.items():
+                    setattr(existing_executor, attr, value)
+            else:
+                # Insert new executor
+                new_executor = Executors(**executor_dict)
+                session.add(new_executor)
+            session.commit()
+
+    def store_position(self, position: Position):
+        with self._sql_manager.get_new_session() as session:
+            session.add(position)
+            session.commit()
+
+    def update_or_store_position(self, position: Position):
+        with self._sql_manager.get_new_session() as session:
+            # Check if a position already exists for this controller, connector, trading pair, and side
+            existing_position = session.query(Position).filter(
+                Position.controller_id == position.controller_id,
+                Position.connector_name == position.connector_name,
+                Position.trading_pair == position.trading_pair,
+                Position.side == position.side
+            ).first()
+
+            if existing_position:
+                # Update the existing position
+                existing_position.timestamp = position.timestamp
+                existing_position.volume_traded_quote = position.volume_traded_quote
+                existing_position.amount = position.amount
+                existing_position.breakeven_price = position.breakeven_price
+                existing_position.unrealized_pnl_quote = position.unrealized_pnl_quote
+                existing_position.cum_fees_quote = position.cum_fees_quote
+            else:
+                # Insert new position
+                session.add(position)
+
+            session.commit()
+
+    def store_controller_config(self, controller_config: ControllerConfigBase):
+        with self._sql_manager.get_new_session() as session:
+            config = json.loads(controller_config.json())
+            base_columns = ["id", "timestamp", "type"]
+            controller = Controllers(id=config["id"],
+                                     timestamp=time.time(),
+                                     type=config["controller_type"],
+                                     config={k: v for k, v in config.items() if k not in base_columns})
+            session.add(controller)
+            session.commit()
+
+    def get_executors_by_ids(self, executor_ids: List[str]):
+        with self._sql_manager.get_new_session() as session:
+            executors = session.query(Executors).filter(Executors.id.in_(executor_ids)).all()
+            return executors
+
+    def get_executors_by_controller(self, controller_id: str = None) -> List[ExecutorInfo]:
+        with self._sql_manager.get_new_session() as session:
+            executors = session.query(Executors).filter(Executors.controller_id == controller_id).all()
+            return [executor.to_executor_info() for executor in executors]
+
+    def get_all_executors(self) -> List[ExecutorInfo]:
+        with self._sql_manager.get_new_session() as session:
+            executors = session.query(Executors).all()
+            return [executor.to_executor_info() for executor in executors]
+
+    def get_positions_by_ids(self, position_ids: List[str]) -> List[Position]:
+        with self._sql_manager.get_new_session() as session:
+            positions = session.query(Position).filter(Position.id.in_(position_ids)).all()
+            return positions
+
+    def get_positions_by_controller(self, controller_id: str = None) -> List[Position]:
+        with self._sql_manager.get_new_session() as session:
+            positions = session.query(Position).filter(Position.controller_id == controller_id).all()
+            return positions
+
+    def get_all_positions(self) -> List[Position]:
+        with self._sql_manager.get_new_session() as session:
+            positions = session.query(Position).all()
+            return positions
 
     def get_orders_for_config_and_market(self, config_file_path: str, market: ConnectorBase,
                                          with_exchange_order_id_present: Optional[bool] = False,
@@ -248,7 +423,16 @@ class MarketsRecorder:
                 order_status: OrderStatus = OrderStatus(order_id=order_id,
                                                         timestamp=timestamp,
                                                         status=event_type.name)
-
+                try:
+                    fee_in_quote = evt.trade_fee.fee_amount_in_token(
+                        trading_pair=evt.trading_pair,
+                        price=evt.price,
+                        order_amount=evt.amount,
+                        token=quote_asset,
+                    )
+                except Exception as e:
+                    self.logger().error(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
+                    fee_in_quote = 0
                 trade_fill_record: TradeFill = TradeFill(
                     config_file_path=self.config_file_path,
                     strategy=self.strategy_name,
@@ -260,11 +444,11 @@ class MarketsRecorder:
                     order_id=order_id,
                     trade_type=evt.trade_type.name,
                     order_type=evt.order_type.name,
-                    price=Decimal(
-                        evt.price) if evt.price == evt.price else Decimal(0),
-                    amount=Decimal(evt.amount),
+                    price=evt.price,
+                    amount=evt.amount,
                     leverage=evt.leverage if evt.leverage else 1,
                     trade_fee=evt.trade_fee.to_json(),
+                    trade_fee_in_quote=fee_in_quote,
                     exchange_trade_id=evt.exchange_trade_id,
                     position=evt.position if evt.position else PositionAction.NIL.value,
                 )
@@ -275,7 +459,6 @@ class MarketsRecorder:
                 market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(trade_fill_record.market,
                                                                                    trade_fill_record.exchange_trade_id,
                                                                                    trade_fill_record.symbol)})
-                self.append_to_csv(trade_fill_record)
 
     def _did_complete_funding_payment(self,
                                       event_tag: int,
@@ -385,39 +568,71 @@ class MarketsRecorder:
     def _did_update_range_position(self,
                                    event_tag: int,
                                    connector: ConnectorBase,
-                                   evt: Union[RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent, RangePositionFeeCollectedEvent]):
+                                   evt: Union[RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent]):
         if threading.current_thread() != threading.main_thread():
             self._ev_loop.call_soon_threadsafe(self._did_update_range_position, event_tag, connector, evt)
             return
 
         timestamp: int = self.db_timestamp
+        event_type: MarketEvent = self.market_event_tag_map[event_tag]
+
+        # Determine order_action based on event type
+        order_action = None
+        if event_type == MarketEvent.RangePositionLiquidityAdded:
+            order_action = "ADD"
+        elif event_type == MarketEvent.RangePositionLiquidityRemoved:
+            order_action = "REMOVE"
+
+        # Calculate trade_fee_in_quote similar to _did_fill_order
+        trading_pair = getattr(evt, 'trading_pair', None)
+        mid_price = Decimal(str(getattr(evt, 'mid_price', 0) or 0))
+        base_amount = Decimal(str(getattr(evt, 'base_amount', 0) or 0))
+        fee_in_quote = Decimal("0")
+        if trading_pair:
+            _, quote_asset = trading_pair.split("-")
+            try:
+                fee_in_quote = evt.trade_fee.fee_amount_in_token(
+                    trading_pair=trading_pair,
+                    price=mid_price,
+                    order_amount=base_amount,
+                    token=quote_asset,
+                )
+            except Exception as e:
+                self.logger().error(f"Error calculating fee in quote for LP position: {e}, will be stored as 0.")
+                fee_in_quote = Decimal("0")
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
-                rp_update: RangePositionUpdate = RangePositionUpdate(hb_id=evt.order_id,
-                                                                     timestamp=timestamp,
-                                                                     tx_hash=evt.exchange_order_id,
-                                                                     token_id=evt.token_id,
-                                                                     trade_fee=evt.trade_fee.to_json())
+                rp_update: RangePositionUpdate = RangePositionUpdate(
+                    hb_id=evt.order_id,
+                    timestamp=timestamp,
+                    tx_hash=evt.exchange_order_id,
+                    token_id=getattr(evt, 'token_id', 0) or 0,
+                    trade_fee=evt.trade_fee.to_json(),
+                    trade_fee_in_quote=float(fee_in_quote),
+                    # P&L tracking fields
+                    config_file_path=self._config_file_path,
+                    market=connector.display_name,
+                    order_action=order_action,
+                    trading_pair=trading_pair,
+                    position_address=getattr(evt, 'position_address', None),
+                    lower_price=float(getattr(evt, 'lower_price', 0) or 0),
+                    upper_price=float(getattr(evt, 'upper_price', 0) or 0),
+                    mid_price=float(mid_price),
+                    base_amount=float(base_amount),
+                    quote_amount=float(getattr(evt, 'quote_amount', 0) or 0),
+                    base_fee=float(getattr(evt, 'base_fee', 0) or 0),
+                    quote_fee=float(getattr(evt, 'quote_fee', 0) or 0),
+                    # Rent tracking: position_rent on ADD, position_rent_refunded on REMOVE
+                    position_rent=float(getattr(evt, 'position_rent', 0) or 0),
+                    position_rent_refunded=float(getattr(evt, 'position_rent_refunded', 0) or 0),
+                )
                 session.add(rp_update)
                 self.save_market_states(self._config_file_path, connector, session=session)
 
-    def _did_close_position(self,
-                            event_tag: int,
-                            connector: ConnectorBase,
-                            evt: RangePositionClosedEvent):
-        if threading.current_thread() != threading.main_thread():
-            self._ev_loop.call_soon_threadsafe(self._did_close_position, event_tag, connector, evt)
-            return
-
-        with self._sql_manager.get_new_session() as session:
-            with session.begin():
-                rp_fees: RangePositionCollectedFees = RangePositionCollectedFees(config_file_path=self._config_file_path,
-                                                                                 strategy=self._strategy_name,
-                                                                                 token_id=evt.token_id,
-                                                                                 token_0=evt.token_0,
-                                                                                 token_1=evt.token_1,
-                                                                                 claimed_fee_0=Decimal(evt.claimed_fee_0),
-                                                                                 claimed_fee_1=Decimal(evt.claimed_fee_1))
-                session.add(rp_fees)
-                self.save_market_states(self._config_file_path, connector, session=session)
+    @staticmethod
+    async def _sleep(delay):
+        """
+        A wrapper function that facilitates patching the sleep in unit tests without affecting the asyncio module
+        """
+        await asyncio.sleep(delay)

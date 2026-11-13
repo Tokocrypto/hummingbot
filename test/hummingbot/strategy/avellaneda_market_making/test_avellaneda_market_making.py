@@ -8,9 +8,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from hummingbot.client import settings
-from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
+from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
 from hummingbot.core.clock import Clock, ClockMode
@@ -92,9 +91,7 @@ class AvellanedaMarketMakingUnitTests(unittest.TestCase):
         trade_fee_schema = TradeFeeSchema(
             maker_percent_fee_decimal=Decimal("0.25"), taker_percent_fee_decimal=Decimal("0.25")
         )
-        self.market: MockPaperExchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        self.market: MockPaperExchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         self.market_info: MarketTradingPairTuple = MarketTradingPairTuple(
             self.market, self.trading_pair, *self.trading_pair.split("-")
         )
@@ -111,8 +108,8 @@ class AvellanedaMarketMakingUnitTests(unittest.TestCase):
                 self.trading_pair.split("-")[0], 6, 6, 6, 6
             )
         )
-        self._original_paper_trade_exchanges = settings.PAPER_TRADE_EXCHANGES
-        settings.PAPER_TRADE_EXCHANGES.append("mock_paper_exchange")
+        self._original_paper_trade_exchanges = AllConnectorSettings.paper_trade_connectors_names
+        AllConnectorSettings.paper_trade_connectors_names.append("mock_paper_exchange")
 
         self.price_delegate = OrderBookAssetPriceDelegate(self.market_info.market, self.trading_pair)
 
@@ -148,7 +145,7 @@ class AvellanedaMarketMakingUnitTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.strategy.stop(self.clock)
         if self._original_paper_trade_exchanges is not None:
-            settings.PAPER_TRADE_EXCHANGES = self._original_paper_trade_exchanges
+            AllConnectorSettings.paper_trade_connectors_names = self._original_paper_trade_exchanges
         super().tearDown()
 
     def get_default_map(self) -> Dict[str, str]:

@@ -9,8 +9,6 @@ import pandas as pd
 from hummingbot.client.performance import PerformanceMetrics
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.connector.gateway.amm.gateway_evm_amm import GatewayEVMAMM
-from hummingbot.connector.gateway.gateway_price_shim import GatewayPriceShim
 from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.market_order import MarketOrder
@@ -18,7 +16,6 @@ from hummingbot.core.data_type.trade_fee import TokenAmount
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     MarketOrderFailureEvent,
-    OrderCancelledEvent,
     OrderExpiredEvent,
     OrderType,
     SellOrderCompletedEvent,
@@ -60,9 +57,7 @@ class AmmArbStrategy(StrategyPyBase):
     _quote_eth_rate_fetch_loop_task: Optional[asyncio.Task]
     _market_1_quote_eth_rate: None          # XXX (martin_kou): Why are these here?
     _market_2_quote_eth_rate: None          # XXX (martin_kou): Why are these here?
-    _rate_source: RateOracle
-    _cancel_outdated_orders_task: Optional[asyncio.Task]
-    _gateway_transaction_cancel_interval: int
+    _rate_source: Optional[RateOracle]
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -80,7 +75,7 @@ class AmmArbStrategy(StrategyPyBase):
                     market_2_slippage_buffer: Decimal = Decimal("0"),
                     concurrent_orders_submission: bool = True,
                     status_report_interval: float = 900,
-                    gateway_transaction_cancel_interval: int = 600,
+                    rate_source: Optional[RateOracle] = RateOracle.get_instance(),
                     ):
         """
         Assigns strategy parameters, this function must be called directly after init.
@@ -98,8 +93,7 @@ class AmmArbStrategy(StrategyPyBase):
         :param concurrent_orders_submission: whether to submit both arbitrage taker orders (buy and sell) simultaneously
         If false, the bot will wait for first exchange order filled before submitting the other order.
         :param status_report_interval: Amount of seconds to wait to refresh the status report
-        :param gateway_transaction_cancel_interval: Amount of seconds to wait before trying to cancel orders that are
-        blockchain transactions that have not been included in a block (they are still in the mempool).
+        :param rate_source: The rate source to use for conversion rate - (RateOracle or FixedRateSource) - default is FixedRateSource
         """
         self._market_info_1 = market_info_1
         self._market_info_2 = market_info_2
@@ -120,10 +114,7 @@ class AmmArbStrategy(StrategyPyBase):
         self.add_markets([market_info_1.market, market_info_2.market])
         self._quote_eth_rate_fetch_loop_task = None
 
-        self._rate_source = RateOracle.get_instance()
-
-        self._cancel_outdated_orders_task = None
-        self._gateway_transaction_cancel_interval = gateway_transaction_cancel_interval
+        self._rate_source = rate_source
 
         self._order_id_side_map: Dict[str, ArbProposalSide] = {}
 
@@ -148,11 +139,11 @@ class AmmArbStrategy(StrategyPyBase):
         self._order_amount = value
 
     @property
-    def rate_source(self) -> RateOracle:
+    def rate_source(self) -> Optional[RateOracle]:
         return self._rate_source
 
     @rate_source.setter
-    def rate_source(self, src: RateOracle):
+    def rate_source(self, src: Optional[RateOracle]):
         self._rate_source = src
 
     @property
@@ -163,10 +154,21 @@ class AmmArbStrategy(StrategyPyBase):
     @lru_cache(maxsize=10)
     def is_gateway_market(market_info: MarketTradingPairTuple) -> bool:
         return market_info.market.name in sorted(
-            AllConnectorSettings.get_gateway_amm_connector_names().union(
-                AllConnectorSettings.get_gateway_clob_connector_names()
-            )
+            AllConnectorSettings.get_gateway_amm_connector_names()
         )
+
+    @staticmethod
+    @lru_cache(maxsize=10)
+    def is_gateway_market_evm_compatible(market_info: MarketTradingPairTuple) -> bool:
+        # Gateway connectors are now managed by Gateway
+        # Assume all gateway connectors are EVM compatible
+        # This can be enhanced later by querying Gateway API
+        connector_name = market_info.market.name
+        connector_settings = AllConnectorSettings.get_connector_settings().get(connector_name)
+        if connector_settings and connector_settings.uses_gateway_generic_connector():
+            # For now, assume all gateway connectors are EVM compatible
+            return True
+        return False
 
     def tick(self, timestamp: float):
         """
@@ -188,8 +190,6 @@ class AmmArbStrategy(StrategyPyBase):
         if self.ready_for_new_arb_trades():
             if self._main_task is None or self._main_task.done():
                 self._main_task = safe_ensure_future(self.main())
-        if self._cancel_outdated_orders_task is None or self._cancel_outdated_orders_task.done():
-            self._cancel_outdated_orders_task = safe_ensure_future(self.apply_gateway_transaction_cancel_interval())
 
     async def main(self):
         """
@@ -228,18 +228,6 @@ class AmmArbStrategy(StrategyPyBase):
         await self.apply_slippage_buffers(profitable_arb_proposals)
         self.apply_budget_constraint(profitable_arb_proposals)
         await self.execute_arb_proposals(profitable_arb_proposals)
-
-    async def apply_gateway_transaction_cancel_interval(self):
-        # XXX (martin_kou): Concurrent cancellations are not supported before the nonce architecture is fixed.
-        # See: https://app.shortcut.com/coinalpha/story/24553/nonce-architecture-in-current-amm-trade-and-evm-approve-apis-is-incorrect-and-causes-trouble-with-concurrent-requests
-        gateway_connectors: List[GatewayEVMAMM] = []
-        if self.is_gateway_market(self._market_info_1):
-            gateway_connectors.append(cast(GatewayEVMAMM, self._market_info_1.market))
-        if self.is_gateway_market(self._market_info_2):
-            gateway_connectors.append(cast(GatewayEVMAMM, self._market_info_2.market))
-
-        for gateway in gateway_connectors:
-            await gateway.cancel_outdated_orders(self._gateway_transaction_cancel_interval)
 
     async def apply_slippage_buffers(self, arb_proposals: List[ArbProposal]):
         """
@@ -349,22 +337,6 @@ class AmmArbStrategy(StrategyPyBase):
         place_order_fn: Callable[[MarketTradingPairTuple, Decimal, OrderType, Decimal], str] = \
             cast(Callable, self.buy_with_specific_market if is_buy else self.sell_with_specific_market)
 
-        # If I'm placing order under a gateway price shim, then the prices in the proposal are fake - I should fetch
-        # the real prices before I make the order on the gateway side. Otherwise, the orders are gonna fail because
-        # the limit price set for them will not match market prices.
-        if self.is_gateway_market(market_info):
-            slippage_buffer: Decimal = self._market_1_slippage_buffer
-            if market_info == self._market_info_2:
-                slippage_buffer = self._market_2_slippage_buffer
-            slippage_buffer_factor: Decimal = Decimal(1) + slippage_buffer
-            if not is_buy:
-                slippage_buffer_factor = Decimal(1) - slippage_buffer
-            market: GatewayEVMAMM = cast(GatewayEVMAMM, market_info.market)
-            if GatewayPriceShim.get_instance().has_price_shim(
-                    market.connector_name, market.chain, market.network, market_info.trading_pair):
-                order_price = await market.get_order_price(market_info.trading_pair, is_buy, amount, ignore_shim=True)
-                order_price *= slippage_buffer_factor
-
         return place_order_fn(market_info, amount, market_info.market.get_taker_order_type(), order_price)
 
     def ready_for_new_arb_trades(self) -> bool:
@@ -399,11 +371,12 @@ class AmmArbStrategy(StrategyPyBase):
                          f"{profit_pct:.2%}")
         return lines
 
-    def quotes_rate_df(self):
-        columns = ["Quotes pair", "Rate"]
+    def get_fixed_rates_df(self):
+        columns = ["Pair", "Rate"]
         quotes_pair: str = f"{self._market_info_2.quote_asset}-{self._market_info_1.quote_asset}"
-        data = [[quotes_pair, PerformanceMetrics.smart_round(self._rate_source.get_pair_rate(quotes_pair))]]
-
+        bases_pair: str = f"{self._market_info_2.base_asset}-{self._market_info_1.base_asset}"
+        data = [[quotes_pair, PerformanceMetrics.smart_round(self._rate_source.get_pair_rate(quotes_pair))],
+                [bases_pair, PerformanceMetrics.smart_round(self._rate_source.get_pair_rate(bases_pair))]]
         return pd.DataFrame(data=data, columns=columns)
 
     async def format_status(self) -> str:
@@ -456,9 +429,9 @@ class AmmArbStrategy(StrategyPyBase):
 
         lines.extend(["", "  Profitability:"] + self.short_proposal_msg(self._all_arb_proposals))
 
-        quotes_rates_df = self.quotes_rate_df()
-        lines.extend(["", f"  Quotes Rates ({str(self._rate_source)})"] +
-                     ["    " + line for line in str(quotes_rates_df).split("\n")])
+        fixed_rates_df = self.get_fixed_rates_df()
+        lines.extend(["", f"  Exchange Rates: ({str(self._rate_source)})"] +
+                     ["    " + line for line in str(fixed_rates_df).split("\n")])
 
         warning_lines = self.network_warning([self._market_info_1])
         warning_lines.extend(self.network_warning([self._market_info_2]))
@@ -510,9 +483,6 @@ class AmmArbStrategy(StrategyPyBase):
 
     def did_fail_order(self, order_failed_event: MarketOrderFailureEvent):
         self.set_order_failed(order_id=order_failed_event.order_id)
-
-    def did_cancel_order(self, cancelled_event: OrderCancelledEvent):
-        self.set_order_completed(order_id=cancelled_event.order_id)
 
     def did_expire_order(self, expired_event: OrderExpiredEvent):
         self.set_order_completed(order_id=expired_event.order_id)

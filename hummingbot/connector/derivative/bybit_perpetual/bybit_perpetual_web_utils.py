@@ -58,9 +58,12 @@ async def get_current_server_time(
         throttler_limit_id=limit_id,
         method=RESTMethod.GET,
     )
-    server_time = float(response["time_now"])
-
-    return server_time
+    time = response.get("result")
+    if time is not None:
+        server_time = float(time["timeNano"])
+        return server_time
+    else:
+        raise ValueError("Failed to get server time")
 
 
 def endpoint_from_message(message: Dict[str, Any]) -> Optional[str]:
@@ -156,6 +159,12 @@ def _build_private_general_rate_limits() -> List[RateLimit]:
             linked_limits=[LinkedLimitWeightPair(CONSTANTS.GET_LIMIT_ID),
                            LinkedLimitWeightPair(CONSTANTS.NON_LINEAR_PRIVATE_BUCKET_120_B_LIMIT_ID)],
         ),
+        RateLimit(
+            limit_id=CONSTANTS.GET_TRANSFERABLE_AMOUNT_PATH_URL[CONSTANTS.LINEAR_MARKET],
+            limit=50,
+            time_interval=1,
+            linked_limits=[LinkedLimitWeightPair(CONSTANTS.GET_LIMIT_ID)],
+        ),
     ]
     return rate_limits
 
@@ -193,7 +202,7 @@ def _build_public_rate_limits():
             limit=CONSTANTS.GET_RATE,
             time_interval=1,
             linked_limits=[LinkedLimitWeightPair(CONSTANTS.GET_LIMIT_ID)],
-        )
+        ),
     ]
     return public_rate_limits
 
@@ -265,16 +274,6 @@ def _build_private_pair_specific_non_linear_rate_limits(trading_pair: str) -> Li
         RateLimit(
             limit_id=get_pair_specific_limit_id(
                 base_limit_id=CONSTANTS.GET_LAST_FUNDING_RATE_PATH_URL[CONSTANTS.NON_LINEAR_MARKET],
-                trading_pair=trading_pair,
-            ),
-            limit=120,
-            time_interval=60,
-            linked_limits=[LinkedLimitWeightPair(CONSTANTS.GET_LIMIT_ID),
-                           LinkedLimitWeightPair(pair_specific_non_linear_private_bucket_120_c_limit_id)],
-        ),
-        RateLimit(
-            limit_id=get_pair_specific_limit_id(
-                base_limit_id=CONSTANTS.GET_PREDICTED_FUNDING_RATE_PATH_URL[CONSTANTS.NON_LINEAR_MARKET],
                 trading_pair=trading_pair,
             ),
             limit=120,
@@ -375,16 +374,6 @@ def _build_private_pair_specific_linear_rate_limits(trading_pair: str) -> List[R
         ),
         RateLimit(
             limit_id=get_pair_specific_limit_id(
-                base_limit_id=CONSTANTS.GET_PREDICTED_FUNDING_RATE_PATH_URL[CONSTANTS.LINEAR_MARKET],
-                trading_pair=trading_pair,
-            ),
-            limit=120,
-            time_interval=60,
-            linked_limits=[LinkedLimitWeightPair(CONSTANTS.GET_LIMIT_ID),
-                           LinkedLimitWeightPair(pair_specific_linear_private_bucket_120_a_limit_id)],
-        ),
-        RateLimit(
-            limit_id=get_pair_specific_limit_id(
                 base_limit_id=CONSTANTS.GET_POSITIONS_PATH_URL[CONSTANTS.LINEAR_MARKET], trading_pair=trading_pair
             ),
             limit=120,
@@ -427,7 +416,7 @@ def _build_private_pair_specific_linear_rate_limits(trading_pair: str) -> List[R
             time_interval=60,
             linked_limits=[LinkedLimitWeightPair(CONSTANTS.GET_LIMIT_ID),
                            LinkedLimitWeightPair(pair_specific_linear_private_bucket_120_a_limit_id)],
-        ),
+        )
     ]
 
     return rate_limits

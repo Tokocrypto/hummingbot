@@ -3,18 +3,6 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
-native_tokens = {
-    "ethereum": "ETH",
-    "avalanche": "AVAX",
-    "solana": "SOL",
-    "polygon": "MATIC",
-    "harmony": "ONE",
-    "cronos": "CRO",
-    "near": "NEAR"
-}
-
-SUPPORTED_CHAINS = set(native_tokens.keys())
-
 
 def flatten(items):
     """
@@ -64,17 +52,52 @@ def build_connector_display(connectors: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(data=data, columns=columns)
 
 
-def build_connector_tokens_display(connectors: List[Dict[str, Any]]) -> pd.DataFrame:
+def build_list_display(connectors: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Display connector information as a table
+    """
+    columns = ["Exchange", "Chains"]
+    data = []
+    for connector_spec in connectors:
+        data.extend([
+            [
+                connector_spec["name"],
+                ', '.join(connector_spec['chains']),
+            ]
+        ])
+
+    return pd.DataFrame(data=data, columns=columns)
+
+
+def build_connector_tokens_display(connectors_chain_network: List[Dict[str, Any]]) -> pd.DataFrame:
     """
     Display connector and the tokens the balance command will report on
     """
     columns = ["Exchange", "Report Token Balances"]
     data = []
-    for connector_spec in connectors:
+    for connector_spec in connectors_chain_network:
         data.extend([
             [
                 f"{connector_spec['connector']}_{connector_spec['chain']}_{connector_spec['network']}",
                 connector_spec.get("tokens", ""),
+            ]
+        ])
+
+    return pd.DataFrame(data=data, columns=columns)
+
+
+def build_balances_allowances_display(symbols: List[str], balances: List[str], allowances: List[str]) -> pd.DataFrame:
+    """
+    Display balances and allowances for a list of symbols as a table
+    """
+    columns = ["Symbol", "Balance", "Allowances"]
+    data = []
+    for i in range(len(symbols)):
+        data.extend([
+            [
+                symbols[i],
+                balances[i],
+                allowances[i]
             ]
         ])
 

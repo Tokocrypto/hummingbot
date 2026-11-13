@@ -36,13 +36,18 @@ class GateIoAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant):
         """
-        Subscribes to order events.
+        Subscribes to order events and balance events.
 
         :param websocket_assistant: the websocket assistant used to connect to the exchange
         """
         try:
-            symbols = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                       for trading_pair in self._trading_pairs]
+            if not self._trading_pairs:
+                # No configured pairs (e.g. hummingbot-api): subscribe to all trading pairs using the
+                # "!all" wildcard, so events for any pair (e.g. manual orders) are also received.
+                symbols = ["!all"]
+            else:
+                symbols = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                           for trading_pair in self._trading_pairs]
 
             orders_change_payload = {
                 "time": int(self._time()),
@@ -64,10 +69,20 @@ class GateIoAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 payload=trades_payload,
                 is_auth_required=True)
 
+            balance_payload = {
+                "time": int(self._time()),
+                "channel": CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
+                "event": "subscribe",  # "unsubscribe" for unsubscription
+            }
+            subscribe_balance_request: WSJSONRequest = WSJSONRequest(
+                payload=balance_payload,
+                is_auth_required=True)
+
             await websocket_assistant.send(subscribe_order_change_request)
             await websocket_assistant.send(subscribe_trades_request)
+            await websocket_assistant.send(subscribe_balance_request)
 
-            self.logger().info("Subscribed to private order changes channels...")
+            self.logger().info("Subscribed to private order changes and balance updates channels...")
         except asyncio.CancelledError:
             raise
         except Exception:

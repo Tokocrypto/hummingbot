@@ -1,6 +1,6 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -20,9 +20,6 @@ from hummingbot.core.data_type.user_stream_tracker_data_source import UserStream
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class GateIoExchange(ExchangePyBase):
     DEFAULT_DOMAIN = ""
@@ -33,9 +30,10 @@ class GateIoExchange(ExchangePyBase):
     web_utils = web_utils
 
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
                  gate_io_api_key: str,
                  gate_io_secret_key: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = DEFAULT_DOMAIN):
@@ -51,9 +49,7 @@ class GateIoExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
 
-        super().__init__(client_config_map)
-
-        self._real_time_balance_update = False
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
     def authenticator(self):
@@ -107,15 +103,21 @@ class GateIoExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT]
+        return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
-        # API documentation does not clarify the error message for timestamp related problems
-        return False
+        return CONSTANTS.ERR_LABEL_TIME_RELATED_ERROR in str(request_exception)
+
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        return CONSTANTS.ERR_LABEL_ORDER_NOT_FOUND in str(status_update_exception)
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        return CONSTANTS.ERR_LABEL_ORDER_NOT_FOUND in str(cancelation_exception)
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
             throttler=self._throttler,
+            time_synchronizer=self._time_synchronizer,
             auth=self._auth)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
@@ -182,15 +184,38 @@ class GateIoExchange(ExchangePyBase):
                            **kwargs) -> Tuple[str, float]:
         order_type_str = order_type.name.lower().split("_")[0]
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-
+        # When type is market, it refers to different currency according to side
+        # side : buy means quote currency, BTC_USDT means USDT
+        # side : sell means base currency，BTC_USDT means BTC
         data = {
             "text": order_id,
             "currency_pair": symbol,
             "side": trade_type.name.lower(),
             "type": order_type_str,
-            "price": f"{price:f}",
             "amount": f"{amount:f}",
         }
+        if order_type.is_limit_type():
+            data.update({
+                "price": f"{price:f}",
+                "time_in_force": "gtc"
+            })
+            if order_type is OrderType.LIMIT_MAKER:
+                data.update({"time_in_force": "poc"})
+        else:
+            data.update({
+                "time_in_force": "ioc",
+            })
+            if trade_type.name.lower() == 'buy':
+                if price.is_nan():
+                    price = self.get_price_for_volume(
+                        trading_pair,
+                        True,
+                        amount
+                    ).result_price
+                data.update({
+                    "amount": f"{price * amount:f}",
+                })
+
         # RESTRequest does not support json, and if we pass a dict
         # the underlying aiohttp will encode it to params
         data = data
@@ -334,6 +359,8 @@ class GateIoExchange(ExchangePyBase):
                 elif channel == CONSTANTS.USER_ORDERS_ENDPOINT_NAME:
                     for order_msg in results:
                         self._process_order_message(order_msg)
+                elif channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
+                    self._process_balance_message_ws(results)
 
             except asyncio.CancelledError:
                 raise
@@ -346,28 +373,44 @@ class GateIoExchange(ExchangePyBase):
         state = None
         # we do not handle:
         #   "failed" because it is handled by create order
-        #   "put" as the exchange order id is returned in the create order response
-        #   "open" for same reason
 
         # same field for both WS and REST
         amount_left = Decimal(order_msg.get("left"))
+        filled_amount = Decimal(order_msg.get("filled_total"))
 
         # WS
         if "event" in order_msg:
             event_type = order_msg.get("event")
+            # "put" is the order accepted/open acknowledgement. We map it to OPEN so the order leaves
+            # PENDING_CREATE promptly (firing the creation event once) instead of staying PENDING_CREATE
+            # until the first fill. Otherwise the creation event is triggered on a FILLED transition,
+            # which races inside ClientOrderTracker.wait_until_completely_filled and can be emitted twice.
+            if event_type == "put":
+                state = OrderState.OPEN
             if event_type == "update":
                 state = OrderState.FILLED
                 if amount_left > 0:
                     state = OrderState.PARTIALLY_FILLED
             if event_type == "finish":
-                state = OrderState.FILLED
-                if amount_left > 0:
+                finish_as = order_msg.get("finish_as")
+                if finish_as == "filled" or finish_as == "ioc":
+                    state = OrderState.FILLED
+                elif finish_as == "cancelled":
                     state = OrderState.CANCELED
+                elif finish_as == "open" and filled_amount > 0:
+                    state = OrderState.PARTIALLY_FILLED
         else:
             status = order_msg.get("status")
+            if status == "open":
+                # REST equivalent of the WS "put" event (see note above).
+                state = OrderState.PARTIALLY_FILLED if filled_amount > 0 else OrderState.OPEN
             if status == "closed":
-                state = OrderState.FILLED
-                if amount_left > 0:
+                finish_as = order_msg.get("finish_as")
+                if finish_as == "filled" or finish_as == "ioc":
+                    state = OrderState.FILLED
+                elif finish_as == "cancelled":
+                    state = OrderState.CANCELED
+                elif finish_as == "open" and filled_amount > 0:
                     state = OrderState.PARTIALLY_FILLED
             if status == "cancelled":
                 state = OrderState.CANCELED
@@ -460,6 +503,12 @@ class GateIoExchange(ExchangePyBase):
         for asset_name in asset_names_to_remove:
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
+
+    def _process_balance_message_ws(self, balance_update):
+        for account in balance_update:
+            asset_name = account["currency"]
+            self._account_available_balances[asset_name] = Decimal(str(account["available"]))
+            self._account_balances[asset_name] = Decimal(str(account["total"]))
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()

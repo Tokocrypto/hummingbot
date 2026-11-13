@@ -39,7 +39,7 @@ class AsyncRequestContextBase(ABC):
         Asynchronous context associated with each API request.
         :param task_logs: Shared task logs associated with this API request
         :param rate_limit: The RateLimit associated with this API Request
-        :param rate_limits: List of linked rate limits with its corresponding weight associated with this API Request
+        :param related_limits: List of linked rate limits with its corresponding weight associated with this API Request
         :param lock: A shared asyncio.Lock used between all instances of APIRequestContextBase
         :param retry_interval: Time between each limit check
         """
@@ -56,11 +56,10 @@ class AsyncRequestContextBase(ABC):
         :return:
         """
         now: Decimal = Decimal(str(time.time()))
-        for task in self._task_logs:
-            task_limit: RateLimit = task.rate_limit
-            elapsed: Decimal = now - Decimal(str(task.timestamp))
-            if elapsed > Decimal(str(task_limit.time_interval * (1 + self._safety_margin_pct))):
-                self._task_logs.remove(task)
+        self._task_logs[:] = [
+            task for task in self._task_logs
+            if now - Decimal(str(task.timestamp)) <= Decimal(str(task.rate_limit.time_interval * (1 + self._safety_margin_pct)))
+        ]
 
     @abstractmethod
     def within_capacity(self) -> bool:
@@ -72,17 +71,24 @@ class AsyncRequestContextBase(ABC):
                 self.flush()
 
                 if self.within_capacity():
-                    break
+                    # Record the task under the same lock hold as the capacity check
+                    self._log_acquired_task()
+                    return
             await asyncio.sleep(self._retry_interval)
-        async with self._lock:
-            now = time.time()
-            # Each related limit is represented as it own individual TaskLog
-            self._task_logs.append(TaskLog(timestamp=now,
-                                           rate_limit=self._rate_limit,
-                                           weight=self._rate_limit.weight))
-            for limit, weight in self._related_limits:
-                task = TaskLog(timestamp=now, rate_limit=limit, weight=weight)
-                self._task_logs.append(task)
+
+    def _log_acquired_task(self):
+        now = time.time()
+        # Each related limit is represented as it own individual TaskLog
+
+        # Log the acquired rate limit into the tasks log
+        new_logs = [
+            TaskLog(timestamp=now, rate_limit=self._rate_limit, weight=self._rate_limit.weight)
+        ] + [
+            # Log its related limits into the tasks log as individual tasks
+            TaskLog(timestamp=now, rate_limit=limit, weight=weight)
+            for limit, weight in self._related_limits
+        ]
+        self._task_logs.extend(new_logs)
 
     async def __aenter__(self):
         await self.acquire()

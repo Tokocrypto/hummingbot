@@ -6,7 +6,7 @@ from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
 if TYPE_CHECKING:
-    from hummingbot.client.hummingbot_application import HummingbotApplication
+    from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
 
 import threading
 
@@ -27,16 +27,16 @@ class OrderBookCommand:
                               exchange: str = None,
                               market: str = None,
                               live: bool = False):
-        if len(self.markets.keys()) == 0:
+        if len(self.trading_core.markets.keys()) == 0:
             self.notify("There is currently no active market.")
             return
         if exchange is not None:
-            if exchange not in self.markets:
+            if exchange not in self.trading_core.markets:
                 self.notify("Invalid exchange")
                 return
-            market_connector = self.markets[exchange]
+            market_connector = self.trading_core.markets[exchange]
         else:
-            market_connector = list(self.markets.values())[0]
+            market_connector = list(self.trading_core.markets.values())[0]
         if market is not None:
             market = market.upper()
             if market not in market_connector.order_books:

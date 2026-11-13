@@ -1,25 +1,17 @@
-import asyncio
 import json
 import unittest
-from typing import Awaitable
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
 import aiohttp
 from aioresponses import aioresponses
 
-from hummingbot.core.web_assistant.connections.data_types import (
-    RESTMethod, RESTResponse, EndpointRESTRequest
-)
+from hummingbot.core.web_assistant.connections.data_types import EndpointRESTRequest, RESTMethod, RESTResponse
 
 
-class DataTypesTest(unittest.TestCase):
+class DataTypesTest(IsolatedAsyncioWrapperTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.ev_loop = asyncio.get_event_loop()
-
-    def async_run_with_timeout(self, coroutine: Awaitable, timeout: int = 1):
-        ret = self.ev_loop.run_until_complete(asyncio.wait_for(coroutine, timeout))
-        return ret
 
     def test_rest_method_to_str(self):
         method = RESTMethod.GET
@@ -28,13 +20,14 @@ class DataTypesTest(unittest.TestCase):
         self.assertEqual("GET", method_str)
 
     @aioresponses()
-    def test_rest_response_properties(self, mocked_api):
+    async def test_rest_response_properties(self, mocked_api):
         url = "https://some.url"
         body = {"one": 1}
         body_str = json.dumps(body)
         headers = {"content-type": "application/json"}
         mocked_api.get(url=url, body=body_str, headers=headers)
-        aiohttp_response = self.async_run_with_timeout(aiohttp.ClientSession().get(url))
+        aiohttp_client_session = aiohttp.ClientSession()
+        aiohttp_response = await (aiohttp_client_session.get(url))
 
         response = RESTResponse(aiohttp_response)
 
@@ -43,22 +36,47 @@ class DataTypesTest(unittest.TestCase):
         self.assertEqual(200, response.status)
         self.assertEqual(headers, response.headers)
 
-        json_ = self.async_run_with_timeout(response.json())
+        json_ = await (response.json())
 
         self.assertEqual(body, json_)
 
-        text = self.async_run_with_timeout(response.text())
+        text = await (response.text())
 
         self.assertEqual(body_str, text)
+        await (aiohttp_client_session.close())
 
     @aioresponses()
-    def test_rest_response_repr(self, mocked_api):
+    async def test_rest_response_with_test_properties(self, mocked_api):
+        url = "https://some.url"
+        data = '{"one": 1}'
+        data_str = data.encode("utf-8")
+        body = f'{data_str}'
+        body_str = json.dumps(body)
+        headers = {"content-type": "text/html"}
+        mocked_api.get(url=url, body=body_str, headers=headers)
+        aiohttp_client_session = aiohttp.ClientSession()
+        aiohttp_response = await (aiohttp_client_session.get(url))
+
+        response = RESTResponse(aiohttp_response)
+
+        self.assertEqual(url, response.url)
+        self.assertEqual(RESTMethod.GET, response.method)
+        self.assertEqual(200, response.status)
+        self.assertEqual(headers, response.headers)
+
+        json_ = await (response.json())
+
+        self.assertEqual(body, json_)
+
+    @aioresponses()
+    async def test_rest_response_repr(self, mocked_api):
         url = "https://some.url"
         body = {"one": 1}
         body_str = json.dumps(body)
         headers = {"content-type": "application/json"}
         mocked_api.get(url=url, body=body_str, headers=headers)
-        aiohttp_response = self.async_run_with_timeout(aiohttp.ClientSession().get(url))
+        aiohttp_client_session = aiohttp.ClientSession()
+        aiohttp_response = await (aiohttp_client_session.get(url))
 
         response = RESTResponse(aiohttp_response)
 
@@ -68,6 +86,44 @@ class DataTypesTest(unittest.TestCase):
         actual = str(response)
 
         self.assertEqual(expected, actual)
+        await (aiohttp_client_session.close())
+
+    @aioresponses()
+    async def test_rest_response_plain_text_returns_as_string(self, mocked_api):
+        """Test that plain text responses that can't be parsed as JSON return as strings"""
+        url = "https://some.url"
+        body = "pong"  # Plain text response
+        headers = {"content-type": "text/plain"}
+        mocked_api.get(url=url, body=body, headers=headers)
+        aiohttp_client_session = aiohttp.ClientSession()
+        aiohttp_response = await (aiohttp_client_session.get(url))
+
+        response = RESTResponse(aiohttp_response)
+
+        # json() should return the plain text string when JSONDecodeError occurs
+        result = await response.json()
+
+        self.assertEqual(body, result)
+        await (aiohttp_client_session.close())
+
+    @aioresponses()
+    async def test_rest_response_plain_text_with_valid_json_returns_parsed(self, mocked_api):
+        """Test that plain text responses containing valid JSON are parsed"""
+        url = "https://some.url"
+        body_dict = {"status": "ok"}
+        body = json.dumps(body_dict)  # Valid JSON in plain text
+        headers = {"content-type": "text/plain"}
+        mocked_api.get(url=url, body=body, headers=headers)
+        aiohttp_client_session = aiohttp.ClientSession()
+        aiohttp_response = await (aiohttp_client_session.get(url))
+
+        response = RESTResponse(aiohttp_response)
+
+        # json() should parse the JSON and return the dict
+        result = await response.json()
+
+        self.assertEqual(body_dict, result)
+        await (aiohttp_client_session.close())
 
 
 class EndpointRESTRequestDummy(EndpointRESTRequest):
@@ -127,3 +183,57 @@ class EndpointRESTRequestTest(unittest.TestCase):
                 endpoint=endpoint,
                 data=data,
             )
+
+    def test_raises_on_params_supplied_to_put_request(self):
+        endpoint = "some/endpoint"
+        params = {"one": 1}
+
+        with self.assertRaises(ValueError):
+            EndpointRESTRequestDummy(
+                method=RESTMethod.PUT,
+                endpoint=endpoint,
+                params=params,
+            )
+
+    def test_raises_on_params_supplied_to_patch_request(self):
+        endpoint = "some/endpoint"
+        params = {"one": 1}
+
+        with self.assertRaises(ValueError):
+            EndpointRESTRequestDummy(
+                method=RESTMethod.PATCH,
+                endpoint=endpoint,
+                params=params,
+            )
+
+    def test_data_to_str_for_put_request(self):
+        endpoint = "some/endpoint"
+        data = {"one": 1}
+
+        request = EndpointRESTRequestDummy(
+            method=RESTMethod.PUT,
+            endpoint=endpoint,
+            data=data,
+        )
+
+        self.assertIsInstance(request.data, str)
+        self.assertEqual(data, json.loads(request.data))
+
+    def test_data_to_str_for_patch_request(self):
+        endpoint = "some/endpoint"
+        data = {"one": 1}
+
+        request = EndpointRESTRequestDummy(
+            method=RESTMethod.PATCH,
+            endpoint=endpoint,
+            data=data,
+        )
+
+        self.assertIsInstance(request.data, str)
+        self.assertEqual(data, json.loads(request.data))
+
+    def test_patch_method_to_str(self):
+        method = RESTMethod.PATCH
+        method_str = str(method)
+
+        self.assertEqual("PATCH", method_str)

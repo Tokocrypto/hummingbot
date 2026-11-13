@@ -12,28 +12,51 @@ fi
 
 if [ "${CONDA_EXE}_" == "_" ]; then
     echo "Please install Anaconda w/ Python 3.7+ first"
-    echo "See: https://www.anaconda.com/distribution/"
+    echo "See: https://www.anaconda.com/download"
     exit 1
 fi
 
-CONDA_BIN=$(dirname ${CONDA_EXE})
-MACOS_ENV=setup/environment.yml
-LINUX_ENV=setup/environment-linux.yml
-LINUX_AARCH64_ENV=setup/environment-linux-aarch64.yml
-WIN64_ENV=setup/environment-win64.yml
-ENV_FILE=$MACOS_ENV
+# Normalize CONDA_EXE to the base install's conda. If an env that ships its own
+# conda (e.g. the hummingbot env) is active, CONDA_EXE points at .../envs/<name>/bin/conda,
+# and running "env create" from there nests the new env under .../envs/<name>/envs/.
+# Strip any /envs/<name> segment back to the base prefix so we always use base conda.
+case "${CONDA_EXE}" in
+    */envs/*) CONDA_EXE="${CONDA_EXE%%/envs/*}/bin/conda" ;;
+esac
 
-if uname | egrep -qe "Linux"; then
-    if uname -m | egrep -qe "aarch64"; then
-        ENV_FILE=$LINUX_AARCH64_ENV
-    else
-        ENV_FILE=$LINUX_ENV
-    fi
-elif uname | egrep -qe "MINGW64"; then
-    ENV_FILE=$WIN64_ENV
+CONDA_BIN=$(dirname ${CONDA_EXE})
+ENV_FILE_1="setup/environment.yml"
+ENV_FILE_2="setup/environment_dydx.yml"
+
+# The default is ENV_FILE_1
+ENV_FILE=$ENV_FILE_1
+
+# Parse command line arguments
+USE_DYDX=false
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        --dydx)
+        USE_DYDX=true
+        shift
+        ;;
+        *)
+        # Handle other unidentified parameters
+        shift
+        ;;
+    esac
+done
+
+# If you use the --dydx flag, switch to ENV_FILE_2
+if [ "$USE_DYDX" = true ]; then
+    ENV_FILE=$ENV_FILE_2
+    echo "install dydx version."
 fi
 
-if ${CONDA_EXE} env list | egrep -qe "^hummingbot"; then
+# Capture the env list first to avoid SIGPIPE (BrokenPipeError) when grep -q
+# exits early, and anchor the match so "hummingbot-site" et al. don't match.
+ENV_LIST=$(${CONDA_EXE} env list)
+if echo "$ENV_LIST" | egrep -qe "^hummingbot[[:space:]]"; then
     ${CONDA_EXE} env update -f $ENV_FILE
 else
     ${CONDA_EXE} env create -f $ENV_FILE
@@ -41,11 +64,29 @@ fi
 
 source "${CONDA_BIN}/activate" hummingbot
 
+# Additional dependencies for Mac OS
+if [ "$(uname)" == "Darwin" ]; then
+    conda install -n hummingbot -y appnope
+fi
+
 # Add the project directory to module search paths.
 conda develop .
 
+# Expose the `hbot` CLI on PATH within the env. `conda develop` does not install console scripts,
+# so symlink the launcher into the env's bin directory.
+ln -sf "$(pwd)/bin/hbot" "${CONDA_PREFIX}/bin/hbot"
+
 # For some reason, this needs to be installed outside of the environment file,
 # or it'll give you the graphviz install error.
-pip install objgraph
+python -m pip install --no-deps -r setup/pip_packages.txt 1> logs/pip_install.log 2>&1
 
 pre-commit install
+
+# Check for build-essential (only relevant for Debian-based systems)
+if [ "$(uname)" = "Linux" ]; then
+    if ! dpkg -s build-essential &> /dev/null; then
+        echo "build-essential not found, installing..."
+        sudo apt-get update && sudo apt-get upgrade -y
+        sudo apt-get install -y build-essential
+    fi
+fi

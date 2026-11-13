@@ -1,8 +1,6 @@
 import unittest
 from decimal import Decimal
 
-from hummingbot.client.config.client_config_map import ClientConfigMap
-from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.budget_checker import BudgetChecker
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
@@ -22,9 +20,7 @@ class BudgetCheckerTest(unittest.TestCase):
         trade_fee_schema = TradeFeeSchema(
             maker_percent_fee_decimal=Decimal("0.01"), taker_percent_fee_decimal=Decimal("0.02")
         )
-        self.exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        self.exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         self.budget_checker: BudgetChecker = self.exchange.budget_checker
 
     def test_populate_collateral_fields_buy_order(self):
@@ -75,9 +71,7 @@ class BudgetCheckerTest(unittest.TestCase):
             taker_percent_fee_decimal=Decimal("0.01"),
             buy_percent_fee_deducted_from_returns=True,
         )
-        exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         budget_checker: BudgetChecker = exchange.budget_checker
         order_candidate = OrderCandidate(
             trading_pair=self.trading_pair,
@@ -125,9 +119,7 @@ class BudgetCheckerTest(unittest.TestCase):
             maker_percent_fee_decimal=Decimal("0.01"),
             taker_percent_fee_decimal=Decimal("0.01"),
         )
-        exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         pfc_quote_pair = combine_to_hb_trading_pair(self.quote_asset, pfc_token)
         exchange.set_balanced_order_book(  # the quote to pfc price will be 1:2
             trading_pair=pfc_quote_pair,
@@ -164,9 +156,7 @@ class BudgetCheckerTest(unittest.TestCase):
             maker_fixed_fees=[TokenAmount(self.quote_asset, Decimal("1"))],
             taker_fixed_fees=[TokenAmount(self.base_asset, Decimal("2"))],
         )
-        exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         budget_checker: BudgetChecker = exchange.budget_checker
 
         order_candidate = OrderCandidate(
@@ -295,9 +285,7 @@ class BudgetCheckerTest(unittest.TestCase):
         trade_fee_schema = TradeFeeSchema(
             maker_fixed_fees=[TokenAmount(self.quote_asset, Decimal("1"))],
         )
-        exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         budget_checker: BudgetChecker = exchange.budget_checker
         exchange.set_balance(self.quote_asset, Decimal("11"))
 
@@ -330,9 +318,7 @@ class BudgetCheckerTest(unittest.TestCase):
         trade_fee_schema = TradeFeeSchema(
             maker_fixed_fees=[TokenAmount(fee_asset, Decimal("11"))],
         )
-        exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         budget_checker: BudgetChecker = exchange.budget_checker
         exchange.set_balance(self.quote_asset, Decimal("100"))
         exchange.set_balance(fee_asset, Decimal("10"))
@@ -354,9 +340,7 @@ class BudgetCheckerTest(unittest.TestCase):
             maker_percent_fee_decimal=Decimal("0.1"),
             maker_fixed_fees=[TokenAmount(self.quote_asset, Decimal("1"))],
         )
-        exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         budget_checker: BudgetChecker = exchange.budget_checker
         exchange.set_balance(self.quote_asset, Decimal("12"))
 
@@ -394,9 +378,7 @@ class BudgetCheckerTest(unittest.TestCase):
             taker_percent_fee_decimal=Decimal("0.01"),
             maker_fixed_fees=[TokenAmount(fc_token, Decimal("1"))]
         )
-        exchange = MockPaperExchange(
-            client_config_map=ClientConfigAdapter(ClientConfigMap()),
-            trade_fee_schema=trade_fee_schema)
+        exchange = MockPaperExchange(trade_fee_schema=trade_fee_schema)
         pfc_quote_pair = combine_to_hb_trading_pair(self.quote_asset, fc_token)
         exchange.set_balanced_order_book(  # the quote to pfc price will be 1:2
             trading_pair=pfc_quote_pair,
@@ -580,3 +562,35 @@ class BudgetCheckerTest(unittest.TestCase):
 
         self.assertEqual(Decimal("7"), first_adjusted_candidate.amount)
         self.assertEqual(Decimal("5"), second_adjusted_candidate.amount)
+
+    def test_adjust_candidate_with_nan_price_does_not_raise(self):
+        """A NaN-priced candidate must be handled, not blow up the caller.
+
+        A venue with no order book (a Gateway swap) prices a candidate as NaN, which
+        propagates into both collateral amounts. `Decimal < NaN` raises
+        InvalidOperation rather than returning False, so both comparisons in
+        OrderCandidate.adjust_from_balances have to be NaN-guarded -- the order
+        collateral one always was, the percent-fee one was not.
+        """
+        self.exchange.set_balanced_order_book(
+            trading_pair=self.trading_pair,
+            mid_price=Decimal("2"),
+            min_price=Decimal("1"),
+            max_price=Decimal("3"),
+            price_step_size=Decimal("1"),
+            volume_step_size=Decimal("1"),
+        )
+        self.exchange.set_balance(self.quote_asset, Decimal("100"))
+        order_candidate = OrderCandidate(
+            trading_pair=self.trading_pair,
+            is_maker=False,
+            order_type=OrderType.LIMIT,
+            order_side=TradeType.BUY,
+            amount=Decimal("10"),
+            price=Decimal("nan"),
+        )
+
+        adjusted_candidate = self.budget_checker.adjust_candidate(order_candidate, all_or_none=False)
+
+        # Nothing can be scaled from a NaN price, so the amount is left untouched.
+        self.assertEqual(Decimal("10"), adjusted_candidate.amount)

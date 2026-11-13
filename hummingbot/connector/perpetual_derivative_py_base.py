@@ -1,7 +1,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from hummingbot.connector.constants import s_decimal_0, s_decimal_NaN
 from hummingbot.connector.derivative.perpetual_budget_checker import PerpetualBudgetChecker
@@ -21,15 +21,14 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class PerpetualDerivativePyBase(ExchangePyBase, ABC):
     VALID_POSITION_ACTIONS = [PositionAction.OPEN, PositionAction.CLOSE]
 
-    def __init__(self, client_config_map: "ClientConfigAdapter"):
-        super().__init__(client_config_map)
+    def __init__(self,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100")):
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
         self._last_funding_fee_payment_ts: Dict[str, float] = {}
 
         self._perpetual_trading = PerpetualTrading(self.trading_pairs)
@@ -39,6 +38,7 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
         self._orderbook_ds: PerpetualAPIOrderBookDataSource = self._orderbook_ds  # for type-hinting
 
         self._budget_checker = PerpetualBudgetChecker(self)
+        self._set_position_mode_lock = asyncio.Lock()
 
     @property
     @abstractmethod
@@ -97,6 +97,8 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
         self._perpetual_trading.start()
         self._funding_info_listener_task = safe_ensure_future(self._listen_for_funding_info())
         if self.is_trading_required:
+            if len(self.supported_position_modes()) > 1:
+                await self._initialize_position_mode()
             self._funding_fee_polling_task = safe_ensure_future(self._funding_payment_polling_loop())
 
     def set_position_mode(self, mode: PositionMode):
@@ -109,6 +111,35 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
             safe_ensure_future(self._execute_set_position_mode(mode))
         else:
             self.logger().error(f"Position mode {mode} is not supported. Mode not set.")
+
+    async def _initialize_position_mode(self):
+        """
+        Fetches the current position mode from the exchange and syncs local state.
+        Called during start_network to ensure the local position mode reflects reality.
+        """
+        async with self._set_position_mode_lock:
+            try:
+                mode = await self._fetch_account_position_mode()
+                if mode is not None:
+                    self._perpetual_trading.set_position_mode(mode)
+                    self.logger().info(f"Position mode initialized to {mode} from exchange.")
+                else:
+                    self.logger().warning("Exchange returned None for position mode. Using default.")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().warning(
+                    "Could not fetch position mode from exchange. Using default.",
+                    exc_info=True,
+                )
+
+    async def _fetch_account_position_mode(self) -> Optional[PositionMode]:
+        """
+        Fetches the current position mode from the exchange account.
+        Connectors should override this to query their exchange API.
+        Returns None if the exchange does not support querying position mode.
+        """
+        return None
 
     def get_leverage(self, trading_pair: str) -> int:
         return self._perpetual_trading.get_leverage(trading_pair)
@@ -202,14 +233,14 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
         """
         raise NotImplementedError
 
-    def _stop_network(self):
+    async def stop_network(self):
         self._funding_fee_poll_notifier = asyncio.Event()
         self._perpetual_trading.stop()
         if self._funding_info_listener_task is not None:
             self._funding_info_listener_task.cancel()
             self._funding_info_listener_task = None
         self._last_funding_fee_payment_ts.clear()
-        super()._stop_network()
+        await super().stop_network()
 
     async def _create_order(
         self,
@@ -303,54 +334,49 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
         )
 
     async def _execute_set_position_mode(self, mode: PositionMode):
-        success, successful_pairs, msg = await self._execute_set_position_mode_for_pairs(
-            mode=mode, trading_pairs=self.trading_pairs
-        )
+        async with self._set_position_mode_lock:
+            try:
+                exchange_mode = await self._fetch_account_position_mode()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().warning(f"Could not fetch position mode from exchange: {e}")
+                exchange_mode = None
 
-        if not success:
-            await self._execute_set_position_mode_for_pairs(
-                mode=self._perpetual_trading.position_mode, trading_pairs=successful_pairs
-            )
-            for trading_pair in self.trading_pairs:
-                self.trigger_event(
-                    AccountEvent.PositionModeChangeFailed,
-                    PositionModeChangeEvent(
-                        self.current_timestamp,
-                        trading_pair,
-                        mode,
-                        msg,
-                    ),
-                )
-        else:
-            self._perpetual_trading.set_position_mode(mode)
-            for trading_pair in self.trading_pairs:
-                self.trigger_event(
-                    AccountEvent.PositionModeChangeSucceeded,
-                    PositionModeChangeEvent(
-                        self.current_timestamp,
-                        trading_pair,
-                        mode,
-                    )
-                )
-            self.logger().debug(f"Position mode switched to {mode}.")
+            self.logger().info(
+                f"Setting position mode: requested={mode}, current_exchange={exchange_mode}")
 
-    async def _execute_set_position_mode_for_pairs(
-        self, mode: PositionMode, trading_pairs: List[str]
-    ) -> Tuple[bool, List[str], str]:
-        successful_pairs = []
-        success = True
-        msg = ""
+            if exchange_mode == mode:
+                self._perpetual_trading.set_position_mode(mode)
+                self._fire_position_mode_events(mode, success=True)
+                self.logger().info(f"Position mode already set to {mode} on exchange.")
+                return
 
-        for trading_pair in trading_pairs:
-            if mode != self._perpetual_trading.position_mode:
-                success, msg = await self._trading_pair_position_mode_set(mode, trading_pair)
+            if not self.trading_pairs:
+                self.logger().warning("No trading pairs configured, cannot set position mode.")
+                return
+
+            success, msg = await self._trading_pair_position_mode_set(mode, self.trading_pairs[0])
+
             if success:
-                successful_pairs.append(trading_pair)
+                self._perpetual_trading.set_position_mode(mode)
+                self._fire_position_mode_events(mode, success=True)
+                self.logger().info(f"Position mode switched to {mode}.")
             else:
-                self.logger().network(f"Error switching {trading_pair} mode to {mode}: {msg}")
-                break
+                self._fire_position_mode_events(mode, success=False, message=msg)
+                self.logger().error(
+                    f"Failed to set position mode to {mode}: {msg}")
 
-        return success, successful_pairs, msg
+    def _fire_position_mode_events(self, mode: PositionMode, success: bool, message: str = ""):
+        event_tag = (
+            AccountEvent.PositionModeChangeSucceeded if success
+            else AccountEvent.PositionModeChangeFailed
+        )
+        for trading_pair in self.trading_pairs:
+            self.trigger_event(
+                event_tag,
+                PositionModeChangeEvent(self.current_timestamp, trading_pair, mode, message),
+            )
 
     async def _execute_set_leverage(self, trading_pair: str, leverage: int):
         success, msg = await self._set_trading_pair_leverage(trading_pair, leverage)
@@ -371,6 +397,68 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
             funding_info = await self._orderbook_ds.get_funding_info(trading_pair)
             self._perpetual_trading.initialize_funding_info(funding_info)
 
+    async def add_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Dynamically adds a trading pair to the perpetual connector.
+        Overrides ExchangePyBase to also handle funding info initialization.
+
+        :param trading_pair: the trading pair to add (e.g., "BTC-USDT")
+        :return: True if successfully added, False otherwise
+        """
+        try:
+            # Step 1: Fetch and initialize funding info (perpetual-specific)
+            self.logger().info(f"Fetching funding info for {trading_pair}...")
+            funding_info = await self._orderbook_ds.get_funding_info(trading_pair)
+            self._perpetual_trading.initialize_funding_info(funding_info)
+
+            # Step 2: Add to perpetual trading's trading pairs list
+            self._perpetual_trading.add_trading_pair(trading_pair)
+
+            # Step 3: Call parent to handle order book (WebSocket subscription + snapshot)
+            success = await super().add_trading_pair(trading_pair)
+            if not success:
+                # Rollback on failure
+                self._perpetual_trading.remove_trading_pair(trading_pair)
+                return False
+
+            self.logger().info(f"Successfully added trading pair {trading_pair} to perpetual connector")
+            return True
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Error adding trading pair {trading_pair}")
+            # Attempt cleanup on failure
+            self._perpetual_trading.remove_trading_pair(trading_pair)
+            return False
+
+    async def remove_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Dynamically removes a trading pair from the perpetual connector.
+        Overrides ExchangePyBase to also clean up funding info.
+
+        :param trading_pair: the trading pair to remove (e.g., "BTC-USDT")
+        :return: True if successfully removed, False otherwise
+        """
+        try:
+            # Step 1: Call parent to handle order book removal
+            success = await super().remove_trading_pair(trading_pair)
+            if not success:
+                self.logger().warning(f"Failed to remove {trading_pair} from order book tracker")
+                # Continue with cleanup anyway
+
+            # Step 2: Clean up perpetual-specific data (funding info, trading pairs list)
+            self._perpetual_trading.remove_trading_pair(trading_pair)
+
+            self.logger().info(f"Successfully removed trading pair {trading_pair} from perpetual connector")
+            return True
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Error removing trading pair {trading_pair}")
+            return False
+
     async def _funding_payment_polling_loop(self):
         """
         Periodically calls _update_funding_payment(), responsible for handling all funding payments.
@@ -378,13 +466,12 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
         await self._update_all_funding_payments(fire_event_on_new=False)  # initialization of the timestamps
         while True:
             await self._funding_fee_poll_notifier.wait()
-            success = await self._update_all_funding_payments(fire_event_on_new=True)
-            if success:
-                # Only when all tasks are successful would the event notifier be reset
-                self._funding_fee_poll_notifier = asyncio.Event()
+            # There is a chance of race condition when the next await allows for a set() to occur before the clear()
+            # Maybe it is better to use a asyncio.Condition() instead of asyncio.Event()?
+            self._funding_fee_poll_notifier.clear()
+            await self._update_all_funding_payments(fire_event_on_new=True)
 
-    async def _update_all_funding_payments(self, fire_event_on_new: bool) -> bool:
-        success = False
+    async def _update_all_funding_payments(self, fire_event_on_new: bool):
         try:
             tasks = []
             for trading_pair in self.trading_pairs:
@@ -393,19 +480,9 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
                         self._update_funding_payment(trading_pair=trading_pair, fire_event_on_new=fire_event_on_new)
                     )
                 )
-            responses: List[bool] = await safe_gather(*tasks)
-            success = all(responses)
+            await safe_gather(*tasks)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            self.logger().network(
-                "Unexpected error while retrieving funding payments.",
-                exc_info=True,
-                app_warning_msg=(
-                    f"Could not fetch funding fee updates for {self.name}. Check API key and network connection."
-                )
-            )
-        return success
 
     async def _update_funding_payment(self, trading_pair: str, fire_event_on_new: bool) -> bool:
         fetch_success = True

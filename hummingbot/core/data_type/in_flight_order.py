@@ -1,7 +1,7 @@
 import asyncio
 import copy
+import logging
 import math
-import typing
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple
@@ -11,9 +11,7 @@ from async_timeout import timeout
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
-
-if typing.TYPE_CHECKING:  # avoid circular import problems
-    from hummingbot.connector.exchange_base import ExchangeBase
+from hummingbot.logger import HummingbotLogger
 
 s_decimal_0 = Decimal("0")
 
@@ -53,6 +51,7 @@ class TradeUpdate(NamedTuple):
     fill_base_amount: Decimal
     fill_quote_amount: Decimal
     fee: TradeFeeBase
+    is_taker: bool = True  # CEXs deliver trade events from the taker's perspective
 
     @property
     def fee_asset(self):
@@ -86,6 +85,8 @@ class TradeUpdate(NamedTuple):
 
 
 class InFlightOrder:
+    _logger: Optional[HummingbotLogger] = None
+
     def __init__(
             self,
             client_order_id: str,
@@ -123,6 +124,14 @@ class InFlightOrder:
         if self.exchange_order_id:
             self.exchange_order_id_update_event.set()
         self.completely_filled_event = asyncio.Event()
+        self.processed_by_exchange_event = asyncio.Event()
+        self.check_processed_by_exchange_condition()
+
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
 
     @property
     def attributes(self) -> Tuple[Any]:
@@ -234,8 +243,10 @@ class InFlightOrder:
         order.order_fills.update({key: TradeUpdate.from_json(value)
                                   for key, value
                                   in data.get("order_fills", {}).items()})
+        order.last_update_timestamp = data.get("last_update_timestamp", order.creation_timestamp)
 
         order.check_filled_condition()
+        order.check_processed_by_exchange_condition()
 
         return order
 
@@ -258,7 +269,10 @@ class InFlightOrder:
             "leverage": str(self.leverage),
             "position": self.position.value,
             "creation_timestamp": self.creation_timestamp,
-            "order_fills": {key: fill.to_json() for key, fill in self.order_fills.items()}
+            "last_update_timestamp": self.last_update_timestamp,
+            "order_fills": {key: fill.to_json() for key, fill in self.order_fills.items()},
+            "cumulative_fee_paid_base": float(self.cumulative_fee_paid(self.base_asset)),
+            "cumulative_fee_paid_quote": float(self.cumulative_fee_paid(self.quote_asset)),
         }
 
     def to_limit_order(self) -> LimitOrder:
@@ -288,23 +302,26 @@ class InFlightOrder:
                 await self.exchange_order_id_update_event.wait()
         return self.exchange_order_id
 
-    def cumulative_fee_paid(self, token: str, exchange: Optional['ExchangeBase'] = None) -> Decimal:
+    def cumulative_fee_paid(self, token: str) -> Decimal:
         """
-        Returns the total amount of fee paid for each traid update, expressed in the specified token
+        Returns the total amount of fee paid for each trade update, expressed in the specified token.
+        Rate conversions are resolved through :class:`RateOracle`, which transparently falls back to
+        live order books of registered connectors when the configured rate source lacks a pair.
+
         :param token: The token all partial fills' fees should be transformed to before summing them
-        :param exchange: The exchange being used. If specified the logic will try to use the order book to get the rate
         :return: the cumulative fee paid for all partial fills in the specified token
         """
         total_fee_in_token = Decimal("0")
-        for trade_update in self.order_fills.values():
-            total_fee_in_token += trade_update.fee.fee_amount_in_token(
-                trading_pair=trade_update.trading_pair,
-                price=trade_update.fill_price,
-                order_amount=trade_update.fill_base_amount,
-                token=token,
-                exchange=exchange
-            )
-
+        try:
+            for trade_update in self.order_fills.values():
+                total_fee_in_token += trade_update.fee.fee_amount_in_token(
+                    trading_pair=self.trading_pair,
+                    price=trade_update.fill_price,
+                    order_amount=trade_update.fill_base_amount,
+                    token=token,
+                )
+        except Exception:
+            self.logger().exception(f"Error calculating fee paid in {token}.")
         return total_fee_in_token
 
     def update_with_order_update(self, order_update: OrderUpdate) -> bool:
@@ -322,6 +339,7 @@ class InFlightOrder:
             self.update_exchange_order_id(order_update.exchange_order_id)
 
         self.current_state = order_update.new_state
+        self.check_processed_by_exchange_condition()
 
         updated: bool = prev_data != (self.exchange_order_id, self.current_state)
 
@@ -359,10 +377,18 @@ class InFlightOrder:
     async def wait_until_completely_filled(self):
         await self.completely_filled_event.wait()
 
+    def check_processed_by_exchange_condition(self):
+        if self.current_state.value > OrderState.PENDING_CREATE.value:
+            self.processed_by_exchange_event.set()
+
+    async def wait_until_processed_by_exchange(self):
+        await self.processed_by_exchange_event.wait()
+
     def build_order_created_message(self) -> str:
         return (
             f"Created {self.order_type.name.upper()} {self.trade_type.name.upper()} order "
-            f"{self.client_order_id} for {self.amount} {self.trading_pair}."
+            f"{self.client_order_id} for {self.amount} {self.trading_pair} "
+            f"at {self.price}."
         )
 
 
@@ -370,5 +396,6 @@ class PerpetualDerivativeInFlightOrder(InFlightOrder):
     def build_order_created_message(self) -> str:
         return (
             f"Created {self.order_type.name.upper()} {self.trade_type.name.upper()} order "
-            f"{self.client_order_id} for {self.amount} to {self.position.name.upper()} a {self.trading_pair} position."
+            f"{self.client_order_id} for {self.amount} to {self.position.name.upper()} a {self.trading_pair} position "
+            f"at {self.price}."
         )

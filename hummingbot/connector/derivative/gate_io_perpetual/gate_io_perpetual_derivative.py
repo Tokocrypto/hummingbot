@@ -1,6 +1,6 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -31,9 +31,6 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 
 class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
     """
@@ -47,14 +44,12 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
 
     web_utils = web_utils
 
-    # ORDER_NOT_EXIST_CONFIRMATION_COUNT = 3
-    # ORDER_NOT_EXIST_CANCEL_COUNT = 2
-
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
                  gate_io_perpetual_api_key: str,
                  gate_io_perpetual_secret_key: str,
                  gate_io_perpetual_user_id: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = DEFAULT_DOMAIN):
@@ -72,7 +67,7 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
 
-        super().__init__(client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
         self._real_time_balance_update = False
 
@@ -147,7 +142,7 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
         :return a list of OrderType supported by this connector.
         Note that Market order type is no longer required and will not be used.
         """
-        return [OrderType.LIMIT, OrderType.MARKET]
+        return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
     def supported_position_modes(self):
         """
@@ -173,6 +168,20 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
         # API documentation does not clarify the error message for timestamp related problems
         return False
 
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        # TODO: implement this method correctly for the connector
+        # The default implementation was added when the functionality to detect not found orders was introduced in the
+        # ExchangePyBase class. Also fix the unit test test_lost_order_removed_if_not_found_during_order_status_update
+        # when replacing the dummy implementation
+        return False
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        # TODO: implement this method correctly for the connector
+        # The default implementation was added when the functionality to detect not found orders was introduced in the
+        # ExchangePyBase class. Also fix the unit test test_cancel_order_not_found_in_the_exchange when replacing the
+        # dummy implementation
+        return False
+
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
             throttler=self._throttler,
@@ -195,6 +204,13 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
             api_factory=self._web_assistants_factory,
             domain=self.domain,
         )
+
+    async def start_network(self):
+        """
+        Start all required tasks to update the status of the connector.
+        """
+        await self._update_trading_rules()
+        await super().start_network()
 
     async def _format_trading_rules(self, raw_trading_pair_info) -> List[TradingRule]:
         """
@@ -283,12 +299,14 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
             "text": order_id,
             "contract": symbol,
             "size": float(-size) if trade_type.name.lower() == 'sell' else float(size),
-            "tif": "gtc",
         }
         if order_type.is_limit_type():
             data.update({
                 "price": f"{price:f}",
+                "tif": "gtc",
             })
+            if order_type is OrderType.LIMIT_MAKER:
+                data.update({"tif": "poc"})
         else:
             data.update({
                 "price": "0",
@@ -584,18 +602,20 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
         ex_trading_pair = position_msg["contract"]
         trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=ex_trading_pair)
         amount = Decimal(str(position_msg["size"]))
+        trading_rule = self._trading_rules[trading_pair]
+        amount_precision = Decimal(trading_rule.min_base_amount_increment)
         position_side = PositionSide.LONG if Decimal(position_msg.get("size")) > 0 else PositionSide.SHORT
         pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
         entry_price = Decimal(str(position_msg["entry_price"]))
         position = self._perpetual_trading.get_position(trading_pair, position_side)
         if position is not None:
             if amount == Decimal("0"):
-                del self._account_positions[pos_key]
+                self._perpetual_trading.remove_position(pos_key)
             else:
                 position.update_position(position_side=position_side,
                                          unrealized_pnl=None,
                                          entry_price=entry_price,
-                                         amount=amount)
+                                         amount=amount * amount_precision)
         else:
             await self._update_positions()
 
@@ -678,9 +698,14 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
             hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(ex_trading_pair)
 
             amount = Decimal(position.get("size"))
-            position_side = PositionSide.LONG if Decimal(position.get("size")) > 0 else PositionSide.SHORT
-
-            pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
+            ex_mode = position.get("mode")
+            if ex_mode == 'single':
+                mode = PositionMode.ONEWAY
+                position_side = PositionSide.LONG if Decimal(position.get("size")) > 0 else PositionSide.SHORT
+            else:
+                mode = PositionMode.HEDGE
+                position_side = PositionSide.LONG if ex_mode == "dual_long" else PositionSide.SHORT
+            pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side, mode)
 
             if amount != 0:
                 trading_rule = self._trading_rules[hb_trading_pair]
@@ -702,36 +727,19 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
             else:
                 self._perpetual_trading.remove_position(pos_key)
 
-    async def _get_position_mode(self) -> Optional[PositionMode]:
-        if self._position_mode is None:
-            response = await self._api_get(
-                path_url=CONSTANTS.POSITION_INFORMATION_URL,
-                is_auth_required=True,
-                limit_id=CONSTANTS.POSITION_INFORMATION_URL
-            )
-            self._position_mode = PositionMode.ONEWAY if response[0]["mode"] == 'single' else PositionMode.HEDGE
+    async def _fetch_account_position_mode(self) -> Optional[PositionMode]:
+        response = await self._api_get(
+            path_url=CONSTANTS.POSITION_INFORMATION_URL,
+            is_auth_required=True,
+            limit_id=CONSTANTS.POSITION_INFORMATION_URL
+        )
+        self._position_mode = PositionMode.ONEWAY if response[0]["mode"] == 'single' else PositionMode.HEDGE
         return self._position_mode
 
-    async def _execute_set_position_mode_for_pairs(
-            # To-do: ensure there's no active order or contract before changing position mode
-            self, mode: PositionMode, trading_pairs: List[str]
-    ) -> Tuple[bool, List[str], str]:
-        successful_pairs = []
-        success = True
-        msg = ""
-
-        for trading_pair in trading_pairs:
-            initial_mode = await self._get_position_mode()
-            if mode != initial_mode:
-                success, msg = await self._trading_pair_position_mode_set(mode, trading_pair)
-                self._position_mode = mode
-            if success:
-                successful_pairs.append(trading_pair)
-            else:
-                self.logger().network(f"Error switching {trading_pair} mode to {mode}: {msg}")
-                break
-
-        return success, successful_pairs, msg
+    async def _get_position_mode(self) -> Optional[PositionMode]:
+        if self._position_mode is None:
+            await self._fetch_account_position_mode()
+        return self._position_mode
 
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
         msg = ""

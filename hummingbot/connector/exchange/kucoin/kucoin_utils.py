@@ -1,9 +1,9 @@
 from decimal import Decimal
 from typing import Any, Dict
 
-from pydantic import Field, SecretStr
+from pydantic import ConfigDict, Field, SecretStr
 
-from hummingbot.client.config.config_data_types import BaseConnectorConfigMap, ClientFieldData
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 CENTRALIZED = True
@@ -28,79 +28,75 @@ def is_pair_information_valid(pair_info: Dict[str, Any]) -> bool:
 
 
 class KuCoinConfigMap(BaseConnectorConfigMap):
-    connector: str = Field(default="kucoin", client_data=None)
+    connector: str = "kucoin"
     kucoin_api_key: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your KuCoin API key",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": "Enter your KuCoin API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
     kucoin_secret_key: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your KuCoin secret key",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": "Enter your KuCoin secret key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
     kucoin_passphrase: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your KuCoin passphrase",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": "Enter your KuCoin passphrase",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
-
-    class Config:
-        title = "kucoin"
+    model_config = ConfigDict(title="kucoin")
 
 
-KEYS = KuCoinConfigMap.construct()
+KEYS = KuCoinConfigMap.model_construct()
 
-OTHER_DOMAINS = ["kucoin_testnet"]
-OTHER_DOMAINS_PARAMETER = {"kucoin_testnet": "testnet"}
-OTHER_DOMAINS_EXAMPLE_PAIR = {"kucoin_testnet": "ETH-USDT"}
-OTHER_DOMAINS_DEFAULT_FEES = {"kucoin_testnet": DEFAULT_FEES}
+OTHER_DOMAINS = ["kucoin_hft"]
+OTHER_DOMAINS_PARAMETER = {"kucoin_hft": "hft"}
+OTHER_DOMAINS_EXAMPLE_PAIR = {"kucoin_hft": "ETH-USDT"}
+OTHER_DOMAINS_DEFAULT_FEES = {"kucoin_hft": DEFAULT_FEES}
 
 
-class KuCoinTestnetConfigMap(BaseConnectorConfigMap):
-    connector: str = Field(default="kucoin_testnet", client_data=None)
-    kucoin_testnet_api_key: SecretStr = Field(
+class KuCoinHFTConfigMap(BaseConnectorConfigMap):
+    connector: str = "kucoin_hft"
+    kucoin_hft_api_key: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your KuCoin Testnet API key",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": "Enter your KuCoin HFT API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
-    kucoin_testnet_secret_key: SecretStr = Field(
+    kucoin_hft_secret_key: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your KuCoin Testnet secret key",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": "Enter your KuCoin HFT secret key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
-    kucoin_testnet_passphrase: SecretStr = Field(
+    kucoin_hft_passphrase: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your KuCoin Testnet passphrase",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": "Enter your KuCoin HFT passphrase",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
-
-    class Config:
-        title = "kucoin_testnet"
+    model_config = ConfigDict(title="kucoin_hft")
 
 
-OTHER_DOMAINS_KEYS = {"kucoin_testnet": KuCoinTestnetConfigMap.construct()}
+OTHER_DOMAINS_KEYS = {"kucoin_hft": KuCoinHFTConfigMap.model_construct()}
